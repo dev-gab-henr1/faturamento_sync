@@ -1,1 +1,1 @@
-web: sleep infinity
+worker: python poll.py
