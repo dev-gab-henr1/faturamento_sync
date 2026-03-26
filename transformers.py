@@ -41,8 +41,41 @@ def task_id_to_link(task_id: str) -> str:
     return f"https://app.clickup.com/t/{task_id}"
 
 
+def clean_description(raw: str) -> str:
+    """
+    Extrai texto puro da description do ClickUp (formato Quill Delta JSON).
+    Retorna "" se vazio, None, ou só linhas em branco.
+    """
+    if not raw or raw == "None":
+        return ""
+    import json
+    text_parts = []
+    decoder = json.JSONDecoder()
+    pos = 0
+    parsed = False
+    while pos < len(raw):
+        s = raw[pos:].lstrip()
+        if not s:
+            break
+        try:
+            obj, end = decoder.raw_decode(s)
+            parsed = True
+            for op in obj.get("ops", []):
+                insert = op.get("insert", "")
+                if isinstance(insert, str):
+                    text_parts.append(insert)
+            pos += (len(raw[pos:]) - len(s)) + end
+        except (json.JSONDecodeError, AttributeError):
+            break
+    if not parsed:
+        # Não é JSON — retornar como texto direto
+        return raw.strip()
+    return "".join(text_parts).strip()
+
+
 # Registro de transformers por nome (usado em field_map)
 TRANSFORMERS = {
     "resolve_dropdown": resolve_dropdown,
     "task_id_to_link": task_id_to_link,
+    "clean_description": clean_description,
 }

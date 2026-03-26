@@ -45,6 +45,11 @@ class RequestStats:
     def uptime_s(self) -> float:
         return time.time() - self._start_time
 
+    @staticmethod
+    def get_memory_mb_safe() -> float:
+        """Wrapper seguro para uso no heartbeat."""
+        return get_memory_mb()
+
 
 # Instância global
 stats = RequestStats()

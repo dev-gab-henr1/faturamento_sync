@@ -73,6 +73,19 @@ def _get_session() -> requests.Session:
     return _SESSION
 
 
+def reset_session() -> None:
+    """Fecha session HTTP e limpa token. Próxima chamada re-autentica."""
+    global _SESSION, _TOKEN
+    if _SESSION is not None:
+        try:
+            _SESSION.close()
+        except Exception:
+            pass
+        _SESSION = None
+    _TOKEN = None
+    logger.info("PowerRev session resetada.")
+
+
 def _authenticate() -> str:
     global _TOKEN
     session = _get_session()
@@ -117,7 +130,8 @@ def _request(method: str, url: str, **kwargs) -> requests.Response:
     global _TOKEN
     session = _get_session()
 
-    for attempt in range(POWERREV_MAX_RETRIES):
+    attempt = 0
+    while attempt < POWERREV_MAX_RETRIES:
         try:
             kwargs["headers"] = _get_headers()
             resp = session.request(method, url, **kwargs)
@@ -127,20 +141,29 @@ def _request(method: str, url: str, **kwargs) -> requests.Response:
                 logger.warning("PowerRev 401, re-autenticando...")
                 _TOKEN = None
                 _authenticate()
-                continue
+                continue  # não incrementa attempt
 
             if resp.status_code == 429:
                 retry_after = int(resp.headers.get("Retry-After", "30"))
                 logger.warning("PowerRev rate limit 429, aguardando %ds", retry_after)
                 time.sleep(retry_after)
+                continue  # não incrementa attempt
+
+            if resp.status_code in (500, 502, 503):
+                attempt += 1
+                wait = 2 ** attempt
+                logger.warning("PowerRev %s (tentativa %d/%d), retry em %ds",
+                               resp.status_code, attempt, POWERREV_MAX_RETRIES, wait)
+                time.sleep(wait)
                 continue
 
             resp.raise_for_status()
             return resp
         except requests.RequestException as exc:
-            logger.warning("PowerRev tentativa %d/%d: %s", attempt + 1, POWERREV_MAX_RETRIES, exc)
-            if attempt < POWERREV_MAX_RETRIES - 1:
-                time.sleep(POWERREV_DELAY * (attempt + 1))
+            attempt += 1
+            logger.warning("PowerRev tentativa %d/%d: %s", attempt, POWERREV_MAX_RETRIES, exc)
+            if attempt < POWERREV_MAX_RETRIES:
+                time.sleep(POWERREV_DELAY * attempt)
             else:
                 raise
     raise RuntimeError("Falha na requisição PowerRev.")

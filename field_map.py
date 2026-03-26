@@ -69,11 +69,7 @@ FIELD_MAP = {
     },
     "observacoes_clickup": {
         "header": "Observações ClickUp",
-        "source": "placeholder",
-    },
-    "aquisicao_faturas": {
-        "header": "Aquisição de faturas",
-        "source": "placeholder",
+        "source": "computed",
     },
     "status_faturamento": {
         "header": "Status de faturamento",
@@ -119,6 +115,13 @@ COMPUTATION_FIELDS = {
         "cf_id": "cafdd69f-fdb7-41c0-9328-940a26be6b3b",
     },
 }
+
+# ── Campos de observações (3 CFs concatenados na coluna L) ─
+OBS_FIELDS = [
+    {"label": "Plano", "cf_id": "48b2d7f1-d2e0-45b4-a58a-3f83686ea980"},
+    {"label": "Gerais", "cf_id": "94ef8acf-865b-4bcc-b763-02ce2aa184a7"},
+    {"label": "Contrato", "cf_id": "1271d921-116c-431e-9e82-0f75ba6f28cb"},
+]
 
 # ── Razões sociais que sempre recebem +1 mês no vencimento
 RAZAO_SOCIAL_VENCTO_EXTRA = {
@@ -189,7 +192,6 @@ COLUMN_ORDER = [
     "distribuidora",
     "tipo_faturamento",
     "observacoes_clickup",
-    "aquisicao_faturas",
     "status_faturamento",
     "data_emissao_fatura",
     "valor_boleto",

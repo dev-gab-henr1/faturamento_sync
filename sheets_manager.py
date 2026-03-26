@@ -26,15 +26,26 @@ SCOPES = [
 ]
 
 _CLIENT: gspread.Client | None = None
+_CREDS_CREATED_AT: float = 0.0
 
 # Colunas protegidas (editáveis manualmente na planilha)
-# São as últimas 2: "validacao" e "observacoes"
-_PROTECTED_KEYS = {"validacao", "observacoes"}
+# Apenas R (Observações) — Q (Validação) é gerida pelo sistema via poll.py
+# Q é escrita como "" por build_row e sobrescrita com "Erro no sistema" apenas para
+# invoices que sumiram da PowerRev. Isso elimina a necessidade de save/restore.
+_PROTECTED_KEYS = {"observacoes"}
 WRITE_COL_COUNT = len([k for k in COLUMN_ORDER if k not in _PROTECTED_KEYS])
+
+# Refresh credentials a cada 45 min (expiram em ~60 min)
+_CREDS_REFRESH_INTERVAL = 45 * 60
 
 
 def _get_client() -> gspread.Client:
-    global _CLIENT
+    global _CLIENT, _CREDS_CREATED_AT
+    now = time.time()
+    if _CLIENT is not None and (now - _CREDS_CREATED_AT) >= _CREDS_REFRESH_INTERVAL:
+        logger.info("Refresh proativo de credenciais Google (%d min desde criação).",
+                     int((now - _CREDS_CREATED_AT) / 60))
+        _CLIENT = None
     if _CLIENT is None:
         creds_info = get_google_credentials_info()
         if creds_info is None:
@@ -44,7 +55,16 @@ def _get_client() -> gspread.Client:
             )
         creds = Credentials.from_service_account_info(creds_info, scopes=SCOPES)
         _CLIENT = gspread.authorize(creds)
+        _CREDS_CREATED_AT = now
     return _CLIENT
+
+
+def reset_client() -> None:
+    """Força re-criação do client na próxima chamada."""
+    global _CLIENT, _CREDS_CREATED_AT
+    _CLIENT = None
+    _CREDS_CREATED_AT = 0.0
+    logger.info("Google Sheets client resetado.")
 
 
 def _retry(fn, *args, max_retries: int = 4, **kwargs):
@@ -113,9 +133,11 @@ def read_all_rows(ws: gspread.Worksheet) -> list[list[str]]:
 
 def write_all_rows(ws: gspread.Worksheet, rows: list[list[str]]) -> None:
     """
-    Reescreve colunas A até P (protege Q e R).
-    Salva Q e R indexados por (UC, Mês Referência) antes de limpar,
-    e restaura na posição correta depois.
+    Reescreve colunas A até Q (protege apenas R - Observações).
+    Q é escrita como "" por build_row; poll.py marca "Erro no sistema" depois.
+    R é salva indexada por (UC, Mês Referência) antes de limpar,
+    e restaurada na posição correta depois.
+    Usa escrita de branco para preservar formatação condicional.
     """
     from stats import stats
     headers = get_headers()
@@ -124,8 +146,8 @@ def write_all_rows(ws: gspread.Worksheet, rows: list[list[str]]) -> None:
     uc_col = headers.index("UC")
     mes_col = headers.index("Mês de Referencia")
 
-    # ── 1) Salvar Q e R existentes, indexados por (UC, Mês Ref) ──
-    protected_start = WRITE_COL_COUNT  # coluna Q (0-based)
+    # ── 1) Salvar R existente, indexado por (UC, Mês Ref) ────
+    protected_start = WRITE_COL_COUNT  # primeira coluna protegida (R, 0-based)
     saved: dict[str, list[str]] = {}
 
     existing = _retry(ws.get_all_values, value_render_option="UNFORMATTED_VALUE")
@@ -146,23 +168,37 @@ def write_all_rows(ws: gspread.Worksheet, rows: list[list[str]]) -> None:
     if saved:
         logger.info("Colunas protegidas: %d linhas salvas.", len(saved))
 
-    # ── 2) Limpar A-P abaixo do header ───────────────────
-    current_rows = ws.row_count
-    if current_rows > 1:
-        clear_range = f"A2:{end_col}{current_rows}"
-        _retry(ws.batch_clear, [clear_range])
-        stats.sheets_write_requests += 1
-
-    if not rows:
-        return
-
-    # ── 3) Expandir planilha se necessário ────────────────
-    needed = len(rows) + 1
+    # ── 2) Expandir planilha se necessário (ANTES de limpar) ──
+    needed = len(rows) + 1 if rows else 1
     if ws.row_count < needed:
         _retry(ws.resize, rows=needed)
         stats.sheets_write_requests += 1
 
-    # ── 4) Escrever A-P em chunks ────────────────────────
+    # ── 3) Limpar valores A-Q apenas nas linhas com dados ──
+    # existing já foi lido no passo 1 — sabemos exatamente quantas linhas têm conteúdo
+    data_rows_count = len(existing) - 1 if len(existing) > 1 else 0  # exclui header
+    rows_to_clear = max(data_rows_count, needed - 1)  # limpar o maior dos dois
+
+    if rows_to_clear > 0:
+        blank_row = [""] * WRITE_COL_COUNT
+        for i in range(0, rows_to_clear, CHUNK_SIZE):
+            chunk_size = min(CHUNK_SIZE, rows_to_clear - i)
+            blank_chunk = [blank_row] * chunk_size
+            start_row = i + 2
+            _retry(
+                ws.update,
+                range_name=f"A{start_row}",
+                values=blank_chunk,
+                value_input_option="RAW",
+            )
+            stats.sheets_write_requests += 1
+            if i + CHUNK_SIZE < rows_to_clear:
+                time.sleep(CHUNK_PAUSE_S)
+
+    if not rows:
+        return
+
+    # ── 4) Escrever A-Q em chunks ────────────────────────
     for i in range(0, len(rows), CHUNK_SIZE):
         chunk = [row[:WRITE_COL_COUNT] for row in rows[i : i + CHUNK_SIZE]]
         start_row = i + 2
@@ -183,51 +219,50 @@ def write_all_rows(ws: gspread.Worksheet, rows: list[list[str]]) -> None:
         if i + CHUNK_SIZE < len(rows):
             time.sleep(CHUNK_PAUSE_S)
 
-    # ── 5) Restaurar Q e R nas posições corretas ─────────
-    if not saved:
-        return
+    # ── 5) Restaurar R nas posições corretas ────────────
+    if saved:
+        protected_updates: list[dict] = []
+        restored = 0
 
-    protected_updates: list[dict] = []
-    restored = 0
+        for i, row in enumerate(rows):
+            if len(row) > max(uc_col, mes_col):
+                uc = str(row[uc_col]).strip()
+                mes = str(row[mes_col]).strip()
+                key = f"{uc}|{mes}"
+                vals = saved.get(key)
+                if vals:
+                    sheet_row = i + 2
+                    # R = WRITE_COL_COUNT + 1 (1-based)
+                    start_cell = gspread.utils.rowcol_to_a1(sheet_row, protected_start + 1)
+                    end_cell = gspread.utils.rowcol_to_a1(sheet_row, protected_start + len(vals))
+                    protected_updates.append({
+                        "range": f"{start_cell}:{end_cell}",
+                        "values": [vals],
+                    })
+                    restored += 1
 
-    for i, row in enumerate(rows):
-        if len(row) > max(uc_col, mes_col):
-            uc = str(row[uc_col]).strip()
-            mes = str(row[mes_col]).strip()
-            key = f"{uc}|{mes}"
-            vals = saved.get(key)
-            if vals:
-                sheet_row = i + 2
-                # Coluna Q = WRITE_COL_COUNT + 1 (1-based)
-                start_cell = gspread.utils.rowcol_to_a1(sheet_row, protected_start + 1)
-                end_cell = gspread.utils.rowcol_to_a1(sheet_row, protected_start + len(vals))
-                protected_updates.append({
-                    "range": f"{start_cell}:{end_cell}",
-                    "values": [vals],
-                })
-                restored += 1
+        if protected_updates:
+            for i in range(0, len(protected_updates), CHUNK_SIZE):
+                chunk = protected_updates[i : i + CHUNK_SIZE]
+                _retry(
+                    ws.batch_update,
+                    chunk,
+                    value_input_option="RAW",
+                )
+                stats.sheets_write_requests += 1
+                stats.sheets_cells_written += sum(len(u["values"][0]) for u in chunk)
+                if i + CHUNK_SIZE < len(protected_updates):
+                    time.sleep(CHUNK_PAUSE_S)
 
-    if protected_updates:
-        for i in range(0, len(protected_updates), CHUNK_SIZE):
-            chunk = protected_updates[i : i + CHUNK_SIZE]
-            _retry(
-                ws.batch_update,
-                chunk,
-                value_input_option="RAW",
+            logger.info("Colunas protegidas: %d linhas restauradas.", restored)
+
+        orphaned = len(saved) - restored
+        if orphaned:
+            logger.warning(
+                "Colunas protegidas: %d linhas não encontraram correspondência (dados órfãos).",
+                orphaned,
             )
-            stats.sheets_write_requests += 1
-            stats.sheets_cells_written += sum(len(u["values"][0]) for u in chunk)
-            if i + CHUNK_SIZE < len(protected_updates):
-                time.sleep(CHUNK_PAUSE_S)
 
-        logger.info("Colunas protegidas: %d linhas restauradas.", restored)
-
-    orphaned = len(saved) - restored
-    if orphaned:
-        logger.warning(
-            "Colunas protegidas: %d linhas não encontraram correspondência (dados órfãos).",
-            orphaned,
-        )
 
 
 def append_rows(ws: gspread.Worksheet, rows: list[list[str]]) -> None:
@@ -303,7 +338,7 @@ def update_columns_in_place(
     ws: gspread.Worksheet,
     updates: dict[int, dict[int, str]],
 ) -> None:
-    """Atualiza células específicas (PowerRev: colunas N, O, P)."""
+    """Atualiza células específicas (PowerRev: N, O, P; integridade: Q)."""
     from stats import stats
     if not updates:
         return

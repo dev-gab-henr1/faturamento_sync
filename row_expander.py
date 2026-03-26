@@ -7,8 +7,9 @@ from datetime import datetime
 from field_map import (
     FIELD_MAP, DATE_FIELDS, COLUMN_ORDER,
     COMPUTATION_FIELDS, DROPDOWN_OPTIONS, RAZAO_SOCIAL_VENCTO_EXTRA,
+    OBS_FIELDS,
 )
-from transformers import TRANSFORMERS
+from transformers import TRANSFORMERS, clean_description
 
 _MONTH_ABBR_PT = {
     1: "jan.", 2: "fev.", 3: "mar.", 4: "abr.",
@@ -27,6 +28,8 @@ for spec in DATE_FIELDS.values():
     _NEEDED_CF_IDS.add(spec["cf_id"])
 for spec in COMPUTATION_FIELDS.values():
     _NEEDED_CF_IDS.add(spec["cf_id"])
+for obs in OBS_FIELDS:
+    _NEEDED_CF_IDS.add(obs["cf_id"])
 
 
 def slim_task(task: dict) -> dict:
@@ -157,6 +160,13 @@ def get_inicio_operacao(task: dict) -> datetime | None:
     return _parse_date(cf.get("value"))
 
 
+def get_fim_operacao(task: dict) -> datetime | None:
+    cf = _get_cf_value(task, DATE_FIELDS["fim_operacao"]["cf_id"])
+    if cf is None:
+        return None
+    return _parse_date(cf.get("value"))
+
+
 def extract_task_uc(task: dict) -> str:
     """Extrai o valor de UC de um task slim."""
     cf = _get_cf_value(task, FIELD_MAP["uc"]["cf_id"])
@@ -186,6 +196,17 @@ def label_to_yyyymm(label: str) -> str:
         return ""
 
 
+def _build_observacoes(task: dict) -> str:
+    """Concatena os 3 campos de observações do ClickUp, só os populados."""
+    parts = []
+    for obs in OBS_FIELDS:
+        raw = _get_cf_raw(task, obs["cf_id"])
+        text = clean_description(raw) if raw else ""
+        if text:
+            parts.append(f"{obs['label']}: {text}")
+    return "\n".join(parts)
+
+
 def build_row(
     task: dict | None,
     invoice: dict,
@@ -205,6 +226,7 @@ def build_row(
         base_values: dict[str, str] = {}
         for key in COLUMN_ORDER:
             base_values[key] = _extract_field_value(task, key)
+        base_values["observacoes_clickup"] = _build_observacoes(task)
 
         dia_envio_raw = _get_cf_raw(task, COMPUTATION_FIELDS["dia_envio_boleto"]["cf_id"])
         dia_vencto_raw = _get_cf_raw(task, COMPUTATION_FIELDS["dia_vencto_boleto"]["cf_id"])

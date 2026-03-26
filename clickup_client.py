@@ -28,6 +28,18 @@ def _get_session() -> requests.Session:
     return _SESSION
 
 
+def reset_session() -> None:
+    """Fecha e descarta a session HTTP. Próxima chamada cria uma nova."""
+    global _SESSION
+    if _SESSION is not None:
+        try:
+            _SESSION.close()
+        except Exception:
+            pass
+        _SESSION = None
+    logger.info("ClickUp session resetada.")
+
+
 def fetch_tasks(
     list_id: str,
     *,
