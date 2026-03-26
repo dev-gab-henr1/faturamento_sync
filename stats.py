@@ -2,6 +2,7 @@
 Monitoramento de requisições e memória.
 Contadores globais + leitura de RSS do processo.
 """
+import gc
 import os
 import time
 import logging
@@ -89,6 +90,22 @@ def log_memory(label: str = "") -> None:
     mb = get_memory_mb()
     prefix = f"[{label}] " if label else ""
     logger.info("%sMemória RSS: %.1f MB", prefix, mb)
+
+
+def force_free_memory() -> None:
+    """gc.collect() + malloc_trim no Linux para devolver memória ao OS.
+
+    CPython não libera arenas de memória de volta ao OS automaticamente.
+    malloc_trim(0) força o glibc a devolver páginas livres, reduzindo RSS.
+    No Windows ou sem glibc, apenas gc.collect() é executado.
+    """
+    gc.collect()
+    try:
+        import ctypes
+        libc = ctypes.CDLL("libc.so.6")
+        libc.malloc_trim(0)
+    except (OSError, AttributeError):
+        pass
 
 
 def log_sync_stats(sync_type: str) -> None:

@@ -12,7 +12,6 @@ Delta sync:
   - Tasks atualizadas no ClickUp → update campos ClickUp in-place
   - PowerRev: checa 3 meses (anterior, atual, próximo)
 """
-import gc
 import os
 import signal
 import sys
@@ -51,7 +50,7 @@ from sheets_manager import (
     reset_client as reset_sheets_client,
 )
 from field_map import get_headers, COLUMN_ORDER, FIELD_MAP, COMPUTATION_FIELDS, RAZAO_SOCIAL_VENCTO_EXTRA
-from stats import stats, log_memory, log_sync_stats
+from stats import stats, log_memory, log_sync_stats, force_free_memory
 
 logging.basicConfig(
     level=logging.INFO,
@@ -148,12 +147,27 @@ def _fetch_invoices_grouped(
 
     while (year < end_year) or (year == end_year and month <= end_month):
         ref = f"{year}{month:02d}"
-        invoices = fetch_invoices_for_month(ref)
-        for inv in invoices:
-            uc = inv.get("uc", "").strip()
-            if uc:
-                uc_invoices.setdefault(uc, []).append(inv)
-        del invoices
+        attempt = 0
+        while True:
+            try:
+                invoices = fetch_invoices_for_month(ref)
+                for inv in invoices:
+                    uc = inv.get("uc", "").strip()
+                    if uc:
+                        uc_invoices.setdefault(uc, []).append(inv)
+                del invoices
+                break
+            except RuntimeError:
+                attempt += 1
+                if attempt >= 3:
+                    raise
+                wait_s = 90
+                logger.warning(
+                    "PowerRev falhou para %s (tentativa %d/3). Aguardando %ds e retry do mesmo mês.",
+                    ref, attempt + 1, wait_s,
+                )
+                time.sleep(wait_s)
+
         month += 1
         if month > 12:
             month = 1
@@ -431,13 +445,14 @@ def _merge_with_disappeared(
     new_rows: list[list[str]],
     ws,
     headers: list[str],
-) -> tuple[list[list[str]], dict[int, dict[int, str]]]:
+) -> tuple[list[list[str]], dict[int, dict[int, str]], list[list[str]]]:
     """
     Preserva linhas cujo invoice sumiu da PowerRev.
     Q = "Erro no sistema" para desaparecidos.
     Q de reaparecidos já é "" (escrito por build_row/write_all_rows).
 
-    Retorna (merged_rows, q_marks_desaparecidos).
+    Retorna (merged_rows, q_marks_desaparecidos, existing_rows).
+    existing_rows é repassado a write_all_rows para evitar leitura duplicada.
     """
     from sheets_manager import WRITE_COL_COUNT
 
@@ -447,7 +462,7 @@ def _merge_with_disappeared(
 
     existing = read_all_rows(ws)
     if not existing:
-        return new_rows, {}
+        return new_rows, {}, existing
 
     # Chaves dos dados novos
     new_keys: set[tuple[str, str]] = set()
@@ -476,7 +491,7 @@ def _merge_with_disappeared(
             disappeared_keys.add((uc, mes))
 
     if not disappeared_keys:
-        return new_rows, {}
+        return new_rows, {}, existing
 
     logger.warning(
         "Integridade PowerRev: %d linhas sumiram — preservando com '%s' em Q.",
@@ -538,7 +553,7 @@ def full_sync() -> None:
     logger.info("PowerRev: período %s a %s", start_ym, end_ym)
 
     del tasks
-    gc.collect()
+    force_free_memory()
     log_memory("Pós-build UC map + gc")
 
     # 4. Fetch PowerRev agrupado por UC
@@ -562,7 +577,7 @@ def full_sync() -> None:
             if q_marks:
                 update_columns_in_place(ws, q_marks)
                 logger.info("Integridade: %d marcações Q aplicadas.", len(q_marks))
-        gc.collect()
+        force_free_memory()
         log_sync_stats("FULL SYNC (sem dados novos)")
         return
 
@@ -571,7 +586,7 @@ def full_sync() -> None:
     logger.info("Total linhas geradas: %d (incl. %d placeholders)", len(rows), len(placeholder_keys))
 
     del uc_invoices, uc_to_task
-    gc.collect()
+    force_free_memory()
     log_memory("Pós-build rows + gc")
 
     # 6. Escrever (com proteção de integridade)
@@ -581,7 +596,8 @@ def full_sync() -> None:
 
     # Detectar invoices que sumiram e preservar suas linhas
     rows_before = len(rows)
-    rows, q_marks = _merge_with_disappeared(rows, ws, headers)
+    rows, q_marks, _ = _merge_with_disappeared(rows, ws, headers)
+
     if len(rows) > rows_before:
         logger.info("Total linhas após merge com desaparecidos: %d (+%d preservadas)",
                      len(rows), len(rows) - rows_before)
@@ -611,7 +627,7 @@ def full_sync() -> None:
     )
 
     del rows
-    gc.collect()
+    force_free_memory()
 
     log_sync_stats("FULL SYNC")
     log_memory("Pós-gc final")
@@ -670,7 +686,7 @@ def delta_sync(last_updated_ts: int) -> int:
         _delta_powerrev_check(ws, headers)
 
     log_sync_stats("DELTA SYNC")
-    gc.collect()
+    force_free_memory()
 
     return now_ms
 
@@ -684,7 +700,7 @@ def _reset_all_sessions(reason: str = "") -> None:
     reset_powerrev_session()
     reset_powerrev_caches()
     reset_sheets_client()
-    gc.collect()
+    force_free_memory()
 
 
 def main() -> None:
@@ -705,7 +721,7 @@ def main() -> None:
             break
         except MemoryError:
             logger.critical("MemoryError no full sync inicial (tentativa %d/3)!", attempt + 1)
-            gc.collect()
+            force_free_memory()
             _reset_all_sessions("MemoryError")
             time.sleep(30)
         except Exception:
@@ -765,7 +781,7 @@ def main() -> None:
                 "Forçando gc + reset de caches.",
                 cycle_count, consecutive_errors,
             )
-            gc.collect()
+            force_free_memory()
             _reset_all_sessions("MemoryError")
             _interruptible_sleep(60)
 

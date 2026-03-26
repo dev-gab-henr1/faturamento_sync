@@ -31,6 +31,16 @@ for spec in COMPUTATION_FIELDS.values():
 for obs in OBS_FIELDS:
     _NEEDED_CF_IDS.add(obs["cf_id"])
 
+# cf_ids de dropdowns que NÃO estão no mapa estático DROPDOWN_OPTIONS.
+# Apenas estes precisam de type_config para fallback no resolve_dropdown.
+# Os demais (Status, Distribuidora, Tipo Faturamento, Mês Envio) já estão
+# cobertos pelo mapa estático e não precisam carregar options da API.
+_NEEDS_TYPE_CONFIG: set[str] = set()
+for _spec in FIELD_MAP.values():
+    if _spec.get("transform") == "resolve_dropdown" and _spec.get("cf_id"):
+        if _spec["cf_id"] not in DROPDOWN_OPTIONS:
+            _NEEDS_TYPE_CONFIG.add(_spec["cf_id"])
+
 
 def slim_task(task: dict) -> dict:
     """Extrai só os campos necessários de uma task crua do ClickUp."""
@@ -39,9 +49,11 @@ def slim_task(task: dict) -> dict:
         cf_id = cf.get("id")
         if cf_id in _NEEDED_CF_IDS:
             slim_cf = {"id": cf_id, "value": cf.get("value")}
-            tc = cf.get("type_config")
-            if tc and "options" in tc:
-                slim_cf["type_config"] = {"options": tc["options"]}
+            # type_config só é necessário para dropdowns sem mapa estático
+            if cf_id in _NEEDS_TYPE_CONFIG:
+                tc = cf.get("type_config")
+                if tc and "options" in tc:
+                    slim_cf["type_config"] = {"options": tc["options"]}
             slim_cfs.append(slim_cf)
     return {
         "id": task.get("id", ""),

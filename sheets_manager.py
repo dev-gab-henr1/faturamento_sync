@@ -131,13 +131,20 @@ def read_all_rows(ws: gspread.Worksheet) -> list[list[str]]:
     return all_data[1:]
 
 
-def write_all_rows(ws: gspread.Worksheet, rows: list[list[str]]) -> None:
+def write_all_rows(
+    ws: gspread.Worksheet,
+    rows: list[list[str]],
+    existing_data_rows: list[list[str]] | None = None,
+) -> None:
     """
     Reescreve colunas A até Q (protege apenas R - Observações).
     Q é escrita como "" por build_row; poll.py marca "Erro no sistema" depois.
     R é salva indexada por (UC, Mês Referência) antes de limpar,
     e restaurada na posição correta depois.
     Usa escrita de branco para preservar formatação condicional.
+
+    Se existing_data_rows for fornecido (linhas sem header, mesmo formato
+    de read_all_rows), pula a leitura interna — economiza 1 API call.
     """
     from stats import stats
     headers = get_headers()
@@ -150,11 +157,17 @@ def write_all_rows(ws: gspread.Worksheet, rows: list[list[str]]) -> None:
     protected_start = WRITE_COL_COUNT  # primeira coluna protegida (R, 0-based)
     saved: dict[str, list[str]] = {}
 
-    existing = _retry(ws.get_all_values, value_render_option="UNFORMATTED_VALUE")
-    stats.sheets_read_requests += 1
+    if existing_data_rows is not None:
+        data_rows = existing_data_rows
+    else:
+        existing = _retry(ws.get_all_values, value_render_option="UNFORMATTED_VALUE")
+        stats.sheets_read_requests += 1
+        data_rows = existing[1:] if len(existing) > 1 else []
 
-    if len(existing) > 1:
-        for row in existing[1:]:
+    data_rows_count = len(data_rows)
+
+    if data_rows:
+        for row in data_rows:
             if len(row) > max(uc_col, mes_col):
                 uc = str(row[uc_col]).strip()
                 mes = str(row[mes_col]).strip()
@@ -175,8 +188,7 @@ def write_all_rows(ws: gspread.Worksheet, rows: list[list[str]]) -> None:
         stats.sheets_write_requests += 1
 
     # ── 3) Limpar valores A-Q apenas nas linhas com dados ──
-    # existing já foi lido no passo 1 — sabemos exatamente quantas linhas têm conteúdo
-    data_rows_count = len(existing) - 1 if len(existing) > 1 else 0  # exclui header
+    # data_rows_count já calculado no passo 1
     rows_to_clear = max(data_rows_count, needed - 1)  # limpar o maior dos dois
 
     if rows_to_clear > 0:
