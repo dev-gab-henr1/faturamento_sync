@@ -36,10 +36,13 @@ for obs in OBS_FIELDS:
 # Os demais (Status, Distribuidora, Tipo Faturamento, Mês Envio) já estão
 # cobertos pelo mapa estático e não precisam carregar options da API.
 _NEEDS_TYPE_CONFIG: set[str] = set()
+_DROPDOWN_CF_IDS: set[str] = set()
 for _spec in FIELD_MAP.values():
     if _spec.get("transform") == "resolve_dropdown" and _spec.get("cf_id"):
+        _DROPDOWN_CF_IDS.add(_spec["cf_id"])
         if _spec["cf_id"] not in DROPDOWN_OPTIONS:
             _NEEDS_TYPE_CONFIG.add(_spec["cf_id"])
+_DROPDOWN_CF_IDS.add(COMPUTATION_FIELDS["mes_envio_boleto"]["cf_id"])
 
 
 def slim_task(task: dict) -> dict:
@@ -49,8 +52,8 @@ def slim_task(task: dict) -> dict:
         cf_id = cf.get("id")
         if cf_id in _NEEDED_CF_IDS:
             slim_cf = {"id": cf_id, "value": cf.get("value")}
-            # type_config só é necessário para dropdowns sem mapa estático
-            if cf_id in _NEEDS_TYPE_CONFIG:
+            # Para dropdowns, guardar options para resolver quando vier orderindex
+            if cf_id in _DROPDOWN_CF_IDS:
                 tc = cf.get("type_config")
                 if tc and "options" in tc:
                     slim_cf["type_config"] = {"options": tc["options"]}
@@ -255,8 +258,9 @@ def build_row(
 
         mes_envio_label = ""
         if mes_envio_raw:
-            cf_id = COMPUTATION_FIELDS["mes_envio_boleto"]["cf_id"]
-            mes_envio_label = _resolve_dropdown_value(cf_id, mes_envio_raw)
+            cf_mes_envio = _get_cf_value(task, COMPUTATION_FIELDS["mes_envio_boleto"]["cf_id"])
+            if cf_mes_envio:
+                mes_envio_label = TRANSFORMERS["resolve_dropdown"](cf_mes_envio)
         mes_seguinte = mes_envio_label == "Mês Seguinte"
         razao_social = base_values.get("razao_social", "")
     else:
@@ -290,6 +294,8 @@ def build_row(
             row.append(str(mes_atendimento))
         elif key == "status_faturamento":
             row.append(invoice.get("status", ""))
+        elif key == "provider_name":
+            row.append(invoice.get("providerName", ""))
         elif key == "data_emissao_fatura":
             row.append(invoice.get("issueDate", ""))
         elif key == "valor_boleto":
