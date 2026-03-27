@@ -526,7 +526,7 @@ def _merge_with_disappeared(
         if (uc, mes) in disappeared_keys:
             q_marks[i + 2] = {val_idx: _ERRO_SISTEMA}
 
-    return merged, q_marks
+    return merged, q_marks, existing
 
 
 def full_sync() -> None:

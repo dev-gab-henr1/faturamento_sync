@@ -274,15 +274,25 @@ def fetch_invoices_for_month(reference_month: str) -> list[dict]:
 
     items: list[dict] = []
     page = 1
+    limit = min(POWERREV_PAGE_LIMIT, 250)
 
     while True:
         try:
             resp = _request(
                 "GET",
-                f"{POWERREV_BASE_URL}/billing/invoice/paginated",
-                params={"referenceMonth": reference_month, "page": page, "limit": POWERREV_PAGE_LIMIT},
+                f"{POWERREV_BASE_URL}/billing/invoice/v2",
+                params={
+                    "referenceMonth": int(reference_month),
+                    "page": page,
+                    "limit": limit,
+                    "countTotal": "false",
+                },
             )
-            result_items, pg, total, qty_per_page = _normalize_items(resp.json())
+            data = resp.json()
+            result_items = data.get("content", [])
+            pg = data.get("page")
+            total = data.get("total")
+            qty_per_page = data.get("quantityPerPage", limit)
         except requests.RequestException:
             try:
                 resp = _request(
@@ -305,7 +315,7 @@ def fetch_invoices_for_month(reference_month: str) -> list[dict]:
             total_pages = (total + qty_per_page - 1) // qty_per_page
             if pg is not None and pg >= total_pages:
                 break
-        elif len(result_items) < POWERREV_PAGE_LIMIT:
+        elif len(result_items) < qty_per_page:
             break
 
         page += 1
@@ -318,6 +328,7 @@ def fetch_invoices_for_month(reference_month: str) -> list[dict]:
         resolved.append({
             "uc": uc or "",
             "referenceMonth": reference_month,
+            "providerName": item.get("providerName", ""),
             "status": _STATUS_TRANSLATION.get(raw_status, raw_status),
             "issueDate": _format_date(item.get("issueDate")),
             "total": _format_currency(item.get("total")),

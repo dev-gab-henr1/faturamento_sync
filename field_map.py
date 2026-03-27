@@ -75,6 +75,10 @@ FIELD_MAP = {
         "header": "Status de faturamento",
         "source": "placeholder",
     },
+    "provider_name": {
+        "header": "Provider",
+        "source": "placeholder",
+    },
     "data_emissao_fatura": {
         "header": "Data de Emissão da fatura",
         "source": "placeholder",
@@ -193,6 +197,7 @@ COLUMN_ORDER = [
     "tipo_faturamento",
     "observacoes_clickup",
     "status_faturamento",
+    "provider_name",
     "data_emissao_fatura",
     "valor_boleto",
     "validacao",
