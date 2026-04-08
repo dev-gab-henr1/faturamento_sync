@@ -325,12 +325,11 @@ def fetch_invoices_for_month(reference_month: str) -> list[dict]:
     for item in items:
         uc = _resolve_uc_installation(item)
         raw_status = str(item.get("status", ""))
-        if raw_status == "MISSING_DISTRIBUTOR_INVOICE":
-            continue
         resolved.append({
             "uc": uc or "",
             "referenceMonth": reference_month,
             "providerName": item.get("providerName", ""),
+            "statusRaw": raw_status,
             "status": _STATUS_TRANSLATION.get(raw_status, raw_status),
             "issueDate": _format_date(item.get("issueDate")),
             "total": _format_currency(item.get("total")),

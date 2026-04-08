@@ -24,7 +24,7 @@ from config import (
     DELTA_SYNC_INTERVAL_S,
     POWERREV_BASE_URL,
 )
-from clickup_client import fetch_all_tasks, reset_session as reset_clickup_session
+from clickup_client import fetch_all_tasks, iter_team_tasks_with_uc, reset_session as reset_clickup_session
 from row_expander import (
     slim_task,
     get_inicio_operacao,
@@ -96,14 +96,161 @@ def _extract_task_id_from_link(link: str) -> str:
     return link
 
 
-def _build_uc_task_map(tasks: list[dict]) -> dict[str, dict]:
-    """Constrói mapa UC → task. Se houver duplicatas, a última vence."""
-    uc_map: dict[str, dict] = {}
+_STATUS_TROCA_PLANO = "25a28dc4-16ff-4ecf-b94f-a7b3a6eef42c"
+_STATUS_CF_ID = "1a5118f7-b9a0-466f-889d-37edd76bd304"
+
+
+def _get_task_status_raw(task: dict) -> str:
+    """Retorna o value bruto do custom field Status Detalhado.
+
+    ClickUp pode retornar:
+      - string UUID
+      - int (orderindex)
+      - dict com id/name
+    """
+    for cf in task.get("custom_fields", []):
+        if cf.get("id") == _STATUS_CF_ID:
+            val = cf.get("value")
+            if isinstance(val, dict):
+                # Preferir id se existir
+                for key in ("id", "value", "uuid", "key", "name"):
+                    if val.get(key):
+                        return str(val.get(key))
+                return ""
+            return str(val) if val is not None else ""
+    return ""
+
+
+def _is_troca_plano(task: dict) -> bool:
+    """Detecta se a task está no status 'Encerrado - Troca de Plano'."""
+    raw = _get_task_status_raw(task)
+    if raw == _STATUS_TROCA_PLANO:
+        return True
+
+    # Tentar resolver pelo mapa de dropdowns (id -> nome)
+    if raw:
+        try:
+            resolved = _resolve_dropdown_value(_STATUS_CF_ID, raw)
+            if resolved == "Encerrado - Troca de Plano":
+                return True
+        except Exception:
+            pass
+
+    # Se value vier como orderindex (ex: 15), usar type_config.options
+    for cf in task.get("custom_fields", []):
+        if cf.get("id") != _STATUS_CF_ID:
+            continue
+        val = cf.get("value")
+        options = cf.get("type_config", {}).get("options", [])
+        if not options:
+            # Fallback: buscar options via API (list/{id}/field)
+            try:
+                from clickup_client import get_custom_field_options
+                options = get_custom_field_options(_STATUS_CF_ID)
+            except Exception:
+                options = []
+        if not options:
+            break
+        try:
+            order = int(val)
+        except (TypeError, ValueError):
+            order = None
+        if order is not None and 0 <= order < len(options):
+            name = options[order].get("name", "")
+            if name == "Encerrado - Troca de Plano":
+                return True
+        else:
+            # tentar por orderindex/id no array
+            for opt in options:
+                if str(opt.get("orderindex")) == str(val) or opt.get("id") == str(val):
+                    if opt.get("name") == "Encerrado - Troca de Plano":
+                        return True
+            break
+
+    # Fallback: caso value venha como dict com name (já capturado pelo _get_task_status_raw)
+    if raw == "Encerrado - Troca de Plano":
+        return True
+
+    return False
+
+
+def _build_uc_task_map(tasks: list[dict]) -> dict[str, list[dict]]:
+    """Constrói mapa UC → lista de tasks.
+
+    UCs com múltiplos cards (troca de plano) terão mais de uma task na lista.
+    A lista é ordenada por inicio_operacao para facilitar resolução por mês.
+    """
+    uc_map: dict[str, list[dict]] = {}
     for task in tasks:
         uc = extract_task_uc(task)
         if uc:
-            uc_map[uc] = task
+            uc_map.setdefault(uc, []).append(task)
+
+    # Ordenar tasks por inicio_operacao para UCs com múltiplas tasks
+    for uc, task_list in uc_map.items():
+        if len(task_list) > 1:
+            task_list.sort(key=lambda t: get_inicio_operacao(t) or datetime(1900, 1, 1))
+
     return uc_map
+
+
+def _resolve_task_for_month(
+    task_list: list[dict], reference_ym: str,
+) -> dict:
+    """Dado uma lista de tasks (ordenada por inicio_operacao) e um referenceMonth,
+    retorna a task correta para aquele mês.
+
+    Regra: a task é válida para um mês se:
+      - inicio_operacao ≤ referenceMonth (ou inicio_operacao ausente)
+      - E fim_operacao ≥ referenceMonth (ou fim_operacao ausente)
+    Entre as tasks válidas, retorna a com inicio_operacao mais recente.
+
+    Só aplica lógica multi-task se pelo menos uma task tem status
+    "Encerrado - Troca de Plano". Caso contrário, retorna a última task (ativa).
+    """
+    if len(task_list) == 1:
+        return task_list[0]
+
+    # Verificar se há troca de plano envolvida
+    has_troca = any(_is_troca_plano(t) for t in task_list)
+    if not has_troca:
+        # Sem troca de plano — retorna a última (comportamento original)
+        return task_list[-1]
+
+    # Converter referenceMonth para comparação
+    ref_year = int(reference_ym[:4]) if len(reference_ym) >= 4 else 0
+    ref_month = int(reference_ym[4:6]) if len(reference_ym) >= 6 else 0
+    ref_date = datetime(ref_year, ref_month, 1) if ref_year and ref_month else None
+
+    if not ref_date:
+        return task_list[-1]
+
+    # Encontrar a task cujo período cobre o referenceMonth
+    best: dict | None = None
+    for task in task_list:
+        inicio = get_inicio_operacao(task)
+        fim = get_fim_operacao(task)
+
+        # Verificar inicio: se preenchido, deve ser ≤ referenceMonth
+        if inicio is not None:
+            inicio_ym = datetime(inicio.year, inicio.month, 1)
+            if inicio_ym > ref_date:
+                continue  # task ainda não começou nesse mês
+
+        # Verificar fim: se preenchido, deve ser ≥ referenceMonth
+        if fim is not None:
+            fim_ym = datetime(fim.year, fim.month, 1)
+            if fim_ym < ref_date:
+                continue  # task já encerrou antes desse mês
+
+        # Task é válida — guardar a mais recente (lista está ordenada por inicio)
+        best = task
+
+    if best is not None:
+        return best
+
+    # Nenhuma task cobre o mês — usar a última (mais recente/ativa)
+    return task_list[-1]
 
 
 def _get_powerrev_date_range(tasks: list[dict]) -> tuple[str, str]:
@@ -130,10 +277,55 @@ def _get_powerrev_date_range(tasks: list[dict]) -> tuple[str, str]:
     return start_ym, end_ym
 
 
+def _build_uc_periods(uc_to_tasks: dict[str, list[dict]]) -> dict[str, tuple[str | None, str | None]]:
+    """Calcula período global (inicio_ym, fim_ym) por UC.
+
+    inicio_ym: menor inicio_operacao (YYYYMM) ou None
+    fim_ym: maior fim_operacao (YYYYMM) ou None (período aberto)
+    """
+    uc_periods: dict[str, tuple[str | None, str | None]] = {}
+    for uc, task_list in uc_to_tasks.items():
+        inicio_global: datetime | None = None
+        fim_global: datetime | None = None
+        has_open_end = False
+
+        for t in task_list:
+            inicio = get_inicio_operacao(t)
+            fim = get_fim_operacao(t)
+
+            if inicio is not None:
+                if inicio_global is None or inicio < inicio_global:
+                    inicio_global = inicio
+
+            if fim is None:
+                has_open_end = True
+            else:
+                if fim_global is None or fim > fim_global:
+                    fim_global = fim
+
+        if has_open_end:
+            fim_global = None
+
+        inicio_ym = f"{inicio_global.year}{inicio_global.month:02d}" if inicio_global else None
+        fim_ym = f"{fim_global.year}{fim_global.month:02d}" if fim_global else None
+        uc_periods[uc] = (inicio_ym, fim_ym)
+
+    return uc_periods
+
+
 def _fetch_invoices_grouped(
-    start_ym: str, end_ym: str,
+    start_ym: str,
+    end_ym: str,
+    *,
+    allowed_ucs: set[str] | None = None,
+    uc_periods: dict[str, tuple[str | None, str | None]] | None = None,
 ) -> dict[str, list[dict]]:
-    """Busca invoices mês a mês, retorna agrupado por UC."""
+    """Busca invoices mês a mês, retorna agrupado por UC.
+
+    Filtros (para reduzir memória):
+      - allowed_ucs: ignora UCs não presentes no ClickUp
+      - uc_periods: ignora invoices fora do período global da UC
+    """
     from powerrev_client import fetch_invoices_for_month, _load_consumer_units, reset_caches
 
     _load_consumer_units()
@@ -153,8 +345,20 @@ def _fetch_invoices_grouped(
                 invoices = fetch_invoices_for_month(ref)
                 for inv in invoices:
                     uc = inv.get("uc", "").strip()
-                    if uc:
-                        uc_invoices.setdefault(uc, []).append(inv)
+                    if not uc:
+                        continue
+
+                    if allowed_ucs is not None and uc not in allowed_ucs:
+                        continue
+
+                    if uc_periods is not None:
+                        inicio_ym, fim_ym = uc_periods.get(uc, (None, None))
+                        if inicio_ym and ref < inicio_ym:
+                            continue
+                        if fim_ym and ref > fim_ym:
+                            continue
+
+                    uc_invoices.setdefault(uc, []).append(inv)
                 del invoices
                 break
             except RuntimeError:
@@ -182,11 +386,14 @@ def _fetch_invoices_grouped(
 
 def _build_rows_from_invoices(
     uc_invoices: dict[str, list[dict]],
-    uc_to_task: dict[str, dict],
+    uc_to_tasks: dict[str, list[dict]],
 ) -> tuple[list[list[str]], set[tuple[str, str]]]:
     """
     Constrói todas as linhas + placeholders para mês seguinte.
     Retorna (rows, placeholder_keys) onde placeholder_keys = {(uc, mes_label), ...}
+
+    Para UCs com múltiplas tasks (troca de plano), cada invoice é enriquecido
+    com a task correta baseado no referenceMonth.
     """
 
     # Mês do placeholder: atual + 1
@@ -200,13 +407,14 @@ def _build_rows_from_invoices(
     placeholder_label = yyyymm_to_label(placeholder_ym)
 
     def uc_sort_key(uc: str):
-        task = uc_to_task.get(uc)
-        if task:
-            dt = get_inicio_operacao(task)
+        task_list = uc_to_tasks.get(uc)
+        if task_list:
+            # Ordenar pelo inicio_operacao da primeira task
+            dt = get_inicio_operacao(task_list[0])
             return dt if dt is not None else _FAR_FUTURE
         return _FAR_FUTURE
 
-    valid_ucs = [uc for uc in uc_invoices if uc in uc_to_task]
+    valid_ucs = [uc for uc in uc_invoices if uc in uc_to_tasks]
     sorted_ucs = sorted(valid_ucs, key=uc_sort_key)
 
     skipped = len(uc_invoices) - len(sorted_ucs)
@@ -218,19 +426,64 @@ def _build_rows_from_invoices(
 
     for uc in sorted_ucs:
         invoices = uc_invoices[uc]
-        task = uc_to_task[uc]
+        task_list = uc_to_tasks[uc]
 
-        # Ignorar invoices após fim de operação
-        fim = get_fim_operacao(task)
-        if fim:
-            fim_ym = f"{fim.year}{fim.month:02d}"
-            before = len(invoices)
-            invoices = [inv for inv in invoices if inv.get("referenceMonth", "") <= fim_ym]
-            dropped = before - len(invoices)
-            if dropped:
-                logger.debug("UC %s: %d invoices ignorados (após fim_operacao %s)", uc, dropped, fim_ym)
-            if not invoices:
+        # Calcular período coberto por todas as tasks da UC
+        # inicio_global = menor inicio_operacao de todas as tasks
+        # fim_global = maior fim_operacao (None = sem fim = ativa)
+        inicio_global: datetime | None = None
+        fim_global: datetime | None = None
+        has_open_end = False  # alguma task sem fim_operacao (ativa)
+
+        for t in task_list:
+            inicio = get_inicio_operacao(t)
+            fim = get_fim_operacao(t)
+
+            if inicio is not None:
+                if inicio_global is None or inicio < inicio_global:
+                    inicio_global = inicio
+
+            if fim is None:
+                has_open_end = True
+            else:
+                if fim_global is None or fim > fim_global:
+                    fim_global = fim
+
+        # Se alguma task não tem fim, o período é aberto (sem limite superior)
+        if has_open_end:
+            fim_global = None
+
+        # Filtrar invoices fora do período coberto
+        before = len(invoices)
+        filtered_invoices = []
+        for inv in invoices:
+            rm = inv.get("referenceMonth", "")
+            if not rm:
                 continue
+            # Filtrar por inicio_global
+            if inicio_global is not None:
+                inicio_ym = f"{inicio_global.year}{inicio_global.month:02d}"
+                if rm < inicio_ym:
+                    continue
+            # Filtrar por fim_global
+            if fim_global is not None:
+                fim_ym = f"{fim_global.year}{fim_global.month:02d}"
+                if rm > fim_ym:
+                    continue
+            filtered_invoices.append(inv)
+
+        dropped = before - len(filtered_invoices)
+        if dropped:
+            logger.debug(
+                "UC %s: %d invoices ignorados (fora do período %s a %s)",
+                uc, dropped,
+                f"{inicio_global.year}{inicio_global.month:02d}" if inicio_global else "?",
+                f"{fim_global.year}{fim_global.month:02d}" if fim_global else "aberto",
+            )
+
+        invoices = filtered_invoices
+        if not invoices:
+            continue
 
         # Ordenar invoices por referenceMonth
         invoices.sort(key=lambda i: i.get("referenceMonth", ""))
@@ -242,15 +495,16 @@ def _build_rows_from_invoices(
             if rm and rm not in unique_months:
                 unique_months.append(rm)
 
-        # Gerar linhas reais
+        # Gerar linhas reais — resolver task correta por mês
         for inv in invoices:
             rm = inv.get("referenceMonth", "")
             mes_atendimento = unique_months.index(rm) + 1 if rm in unique_months else 0
+            task = _resolve_task_for_month(task_list, rm)
             row = build_row(task, inv, mes_atendimento)
             all_rows.append(row)
 
         # Gerar placeholder se necessário
-        if fim and (fim.year, fim.month) < (py, pm):
+        if fim_global and (fim_global.year, fim_global.month) < (py, pm):
             continue  # cooperado encerrou antes do mês do placeholder
 
         if placeholder_ym in unique_months:
@@ -263,6 +517,8 @@ def _build_rows_from_invoices(
             "total": "R$0,00",
         }
         mes_atendimento = len(unique_months) + 1
+        # Placeholder usa a task mais recente (ativa)
+        task = _resolve_task_for_month(task_list, placeholder_ym)
         row = build_row(task, placeholder_invoice, mes_atendimento)
         all_rows.append(row)
         placeholder_keys.add((uc, placeholder_label))
@@ -445,6 +701,7 @@ def _merge_with_disappeared(
     new_rows: list[list[str]],
     ws,
     headers: list[str],
+    uc_to_tasks: dict[str, list[dict]] | None = None,
 ) -> tuple[list[list[str]], dict[int, dict[int, str]], list[list[str]]]:
     """
     Preserva linhas cujo invoice sumiu da PowerRev.
@@ -476,12 +733,57 @@ def _merge_with_disappeared(
     disappeared_by_uc: dict[str, list[list[str]]] = {}
     disappeared_keys: set[tuple[str, str]] = set()
 
+    def _is_within_uc_period(uc: str, yyyymm: str) -> bool:
+        if not uc_to_tasks:
+            return True
+        task_list = uc_to_tasks.get(uc)
+        if not task_list or not yyyymm:
+            return True
+
+        inicio_global: datetime | None = None
+        fim_global: datetime | None = None
+        has_open_end = False
+
+        for t in task_list:
+            inicio = get_inicio_operacao(t)
+            fim = get_fim_operacao(t)
+
+            if inicio is not None:
+                if inicio_global is None or inicio < inicio_global:
+                    inicio_global = inicio
+
+            if fim is None:
+                has_open_end = True
+            else:
+                if fim_global is None or fim > fim_global:
+                    fim_global = fim
+
+        if has_open_end:
+            fim_global = None
+
+        # Comparação por YYYYMM
+        if inicio_global is not None:
+            inicio_ym = f"{inicio_global.year}{inicio_global.month:02d}"
+            if yyyymm < inicio_ym:
+                return False
+
+        if fim_global is not None:
+            fim_ym = f"{fim_global.year}{fim_global.month:02d}"
+            if yyyymm > fim_ym:
+                return False
+
+        return True
+
     for row in existing:
         uc = str(row[uc_idx]).strip() if len(row) > uc_idx else ""
         mes = str(row[mes_idx]).strip() if len(row) > mes_idx else ""
         if not uc or not mes:
             continue
         if (uc, mes) not in new_keys:
+            # Se a linha está fora do período da UC, não deve ser preservada
+            yyyymm = label_to_yyyymm(mes)
+            if yyyymm and not _is_within_uc_period(uc, yyyymm):
+                continue
             # Preservar A-Q, mas forçar Q="" (será marcado via q_marks)
             preserved = [str(v) for v in row[:WRITE_COL_COUNT]]
             while len(preserved) < WRITE_COL_COUNT:
@@ -546,19 +848,78 @@ def full_sync() -> None:
 
     # 2. Mapa UC → task
     uc_to_task = _build_uc_task_map(tasks)
-    logger.info("UCs mapeadas do ClickUp: %d", len(uc_to_task))
+    logger.info("UCs mapeadas do ClickUp (listas): %d", len(uc_to_task))
 
-    # 3. Determinar range de meses
+    # 3. Fallback: buscar tasks do workspace inteiro que tenham UC preenchida
+    #    Cobre tasks que não aparecem via Get Tasks das 3 listas.
+    #    Filtra por list.id no código para garantir que só aceita tasks das listas permitidas.
+    from field_map import FIELD_MAP
+    from config import CLICKUP_LIST_IDS
+    uc_cf_id = FIELD_MAP["uc"]["cf_id"]
+    allowed_lists = set(CLICKUP_LIST_IDS)
+
+    # Busca SEM slim_task para ter acesso ao campo list.id
+    fallback_count = 0
+    fallback_seen = 0
+    for t in iter_team_tasks_with_uc(uc_cf_id):
+        fallback_seen += 1
+        # Só aceitar tasks cuja home list está nas listas permitidas
+        task_list_id = t.get("list", {}).get("id", "")
+        if task_list_id not in allowed_lists:
+            continue
+
+        uc = extract_task_uc(t)
+        if not uc:
+            continue
+
+        slimmed = slim_task(t)
+        tid = t.get("id", "")
+
+        if uc not in uc_to_task:
+            uc_to_task[uc] = [slimmed]
+            _known_task_ids.add(tid)
+            fallback_count += 1
+        else:
+            # Evitar duplicatas — só adicionar se task_id é novo
+                existing_ids = {et.get("id", "") for et in uc_to_task[uc]}
+                if tid not in existing_ids:
+                    uc_to_task[uc].append(slimmed)
+                    _known_task_ids.add(tid)
+                    fallback_count += 1
+    force_free_memory()
+    if fallback_count:
+        logger.info("Fallback ClickUp: %d tasks extras recuperadas do workspace.", fallback_count)
+    logger.info("Fallback ClickUp: %d tasks com UC analisadas (streaming).", fallback_seen)
+
+    # Re-ordenar listas com múltiplas tasks por inicio_operacao
+    multi_uc_count = 0
+    for uc, tl in uc_to_task.items():
+        if len(tl) > 1:
+            tl.sort(key=lambda t: get_inicio_operacao(t) or datetime(1900, 1, 1))
+            multi_uc_count += 1
+    if multi_uc_count:
+        logger.info("UCs com múltiplos cards (troca de plano): %d", multi_uc_count)
+
+    logger.info("UCs mapeadas total: %d", len(uc_to_task))
+
+    # 4. Determinar range de meses
     start_ym, end_ym = _get_powerrev_date_range(tasks)
     logger.info("PowerRev: período %s a %s", start_ym, end_ym)
 
     del tasks
     force_free_memory()
-    log_memory("Pós-build UC map + gc")
+    log_memory("Pós-build UC map + fallback + gc")
 
-    # 4. Fetch PowerRev agrupado por UC
+    # 5. Fetch PowerRev agrupado por UC
     if POWERREV_BASE_URL:
-        uc_invoices = _fetch_invoices_grouped(start_ym, end_ym)
+        allowed_ucs = set(uc_to_task.keys())
+        uc_periods = _build_uc_periods(uc_to_task)
+        uc_invoices = _fetch_invoices_grouped(
+            start_ym,
+            end_ym,
+            allowed_ucs=allowed_ucs,
+            uc_periods=uc_periods,
+        )
         log_memory("Pós-fetch PowerRev")
     else:
         logger.warning("PowerRev não configurada — nenhuma linha será gerada.")
@@ -571,7 +932,7 @@ def full_sync() -> None:
         headers = get_headers()
         # Sem dados novos, mas preservar linhas existentes como "Erro no sistema"
         rows_empty: list[list[str]] = []
-        rows_empty, q_marks = _merge_with_disappeared(rows_empty, ws, headers)
+        rows_empty, q_marks, _ = _merge_with_disappeared(rows_empty, ws, headers, uc_to_task)
         if rows_empty:
             write_all_rows(ws, rows_empty)
             if q_marks:
@@ -581,13 +942,9 @@ def full_sync() -> None:
         log_sync_stats("FULL SYNC (sem dados novos)")
         return
 
-    # 5. Montar linhas (invoice = linha, enriquecido com ClickUp) + placeholders
+    # 6. Montar linhas (invoice = linha, enriquecido com ClickUp) + placeholders
     rows, placeholder_keys = _build_rows_from_invoices(uc_invoices, uc_to_task)
     logger.info("Total linhas geradas: %d (incl. %d placeholders)", len(rows), len(placeholder_keys))
-
-    del uc_invoices, uc_to_task
-    force_free_memory()
-    log_memory("Pós-build rows + gc")
 
     # 6. Escrever (com proteção de integridade)
     ws = get_worksheet()
@@ -596,7 +953,11 @@ def full_sync() -> None:
 
     # Detectar invoices que sumiram e preservar suas linhas
     rows_before = len(rows)
-    rows, q_marks, _ = _merge_with_disappeared(rows, ws, headers)
+    rows, q_marks, _ = _merge_with_disappeared(rows, ws, headers, uc_to_task)
+
+    del uc_invoices, uc_to_task
+    force_free_memory()
+    log_memory("Pós-build rows + gc")
 
     if len(rows) > rows_before:
         logger.info("Total linhas após merge com desaparecidos: %d (+%d preservadas)",
