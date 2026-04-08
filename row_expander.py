@@ -48,12 +48,14 @@ _DROPDOWN_CF_IDS.add(COMPUTATION_FIELDS["mes_envio_boleto"]["cf_id"])
 def slim_task(task: dict) -> dict:
     """Extrai só os campos necessários de uma task crua do ClickUp."""
     slim_cfs = []
+    status_cf_id = FIELD_MAP["status"]["cf_id"]
     for cf in task.get("custom_fields", []):
         cf_id = cf.get("id")
         if cf_id in _NEEDED_CF_IDS:
             slim_cf = {"id": cf_id, "value": cf.get("value")}
             # Para dropdowns, guardar options para resolver quando vier orderindex
-            if cf_id in _DROPDOWN_CF_IDS:
+            # Inclui também Status Detalhado para detectar "Encerrado - Troca de Plano"
+            if cf_id in _DROPDOWN_CF_IDS or cf_id == status_cf_id:
                 tc = cf.get("type_config")
                 if tc and "options" in tc:
                     slim_cf["type_config"] = {"options": tc["options"]}

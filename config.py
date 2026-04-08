@@ -11,6 +11,7 @@ load_dotenv()
 # ── ClickUp ──────────────────────────────────────────────
 CLICKUP_TOKEN = os.getenv("CLICKUP_TOKEN", "")
 CLICKUP_BASE_URL = "https://api.clickup.com/api/v2"
+CLICKUP_TEAM_ID = os.getenv("CLICKUP_TEAM_ID", "9013290037")
 
 CLICKUP_LIST_IDS = [
     "901322296001",
