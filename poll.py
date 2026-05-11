@@ -1,4 +1,4 @@
-"""
+﻿"""
 Faturamento Sync – loop principal.
 
 Fluxo full sync:
@@ -17,12 +17,37 @@ import signal
 import sys
 import time
 import logging
-from datetime import datetime
+import atexit
+import socket
+import random
+import re
+from collections import defaultdict, deque
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
+from dateutil.tz import gettz
+
+try:
+    import msvcrt  # type: ignore[attr-defined]
+except ImportError:  # pragma: no cover
+    msvcrt = None
+
+try:
+    import fcntl  # type: ignore[attr-defined]
+except ImportError:  # pragma: no cover
+    fcntl = None
 
 from config import (
-    FULL_SYNC_INTERVAL_S,
     DELTA_SYNC_INTERVAL_S,
+    FULL_SYNC_DAILY_TIME,
+    FULL_SYNC_TIMEZONE,
+    FULL_SYNC_RETRY_BASE_S,
+    FULL_SYNC_RETRY_MAX_S,
     POWERREV_BASE_URL,
+    POWERREV_REFERENCE_MONTH_ONLY,
+    DISTRIBUTED_LOCK_ENABLED,
+    DISTRIBUTED_LOCK_TTL_S,
+    DISTRIBUTED_LOCK_REFRESH_S,
+    DISTRIBUTED_LOCK_TAB_NAME,
 )
 from clickup_client import fetch_all_tasks, iter_team_tasks_with_uc, reset_session as reset_clickup_session
 from row_expander import (
@@ -44,13 +69,21 @@ from sheets_manager import (
     get_worksheet,
     ensure_headers,
     read_all_rows,
+    read_column_values,
     write_all_rows,
     append_rows,
     update_columns_in_place,
     reset_client as reset_sheets_client,
 )
 from field_map import get_headers, COLUMN_ORDER, FIELD_MAP, COMPUTATION_FIELDS, RAZAO_SOCIAL_VENCTO_EXTRA
-from stats import stats, log_memory, log_sync_stats, force_free_memory
+from stats import (
+    stats,
+    log_memory,
+    log_sync_stats,
+    force_free_memory,
+    begin_memory_cycle,
+    end_memory_cycle,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -59,28 +92,55 @@ logging.basicConfig(
 )
 logger = logging.getLogger("faturamento_sync")
 
-# ── Shutdown graceful via SIGTERM (Railway deploy) ───────
+# comentario normalizado
 _shutdown_requested = False
 
 
 def _handle_sigterm(signum, frame):
     global _shutdown_requested
-    logger.info("Sinal SIGTERM recebido — shutdown graceful solicitado.")
+    logger.info("Sinal SIGTERM recebido - shutdown graceful solicitado.")
     _shutdown_requested = True
 
 
 signal.signal(signal.SIGTERM, _handle_sigterm)
 # SIGINT (Ctrl+C) mantém comportamento padrão: levanta KeyboardInterrupt
 
-# ── Constantes ───────────────────────────────────────────
+# comentario normalizado
 _MAX_CONSECUTIVE_ERRORS = 5  # após N erros seguidos, reset total de sessions
 _ERROR_BACKOFF_BASE = 30     # backoff base em segundos
 _ERROR_BACKOFF_MAX = 300     # backoff máximo (5 min)
 _ERRO_SISTEMA = "Erro no sistema"  # marca em Q para invoices que sumiram da PowerRev
-_NAO_PROCESSADO = "Não processado"  # marca em Q para fatura do mês seguinte ainda não gerada
+_NAO_PROCESSADO = "Não processado"  # marca em Q para fatura do mes seguinte ainda nao gerada
 
 _known_task_ids: set[str] = set()
 _FAR_FUTURE = datetime(9999, 1, 1)
+_LOCK_FILE_PATH = os.path.join(os.path.dirname(__file__), ".faturamento_sync.lock")
+_LOCK_HANDLE = None
+_DLOCK_OWNER_ID = f"{socket.gethostname()}:{os.getpid()}:{int(time.time())}:{random.randint(1000,9999)}"
+_DLOCK_LAST_REFRESH_TS = 0.0
+
+
+def _resolve_full_sync_tz(tz_name: str):
+    zone_name = (tz_name or "America/Sao_Paulo").strip() or "America/Sao_Paulo"
+    try:
+        return ZoneInfo(zone_name)
+    except Exception:
+        tz_fallback = gettz(zone_name)
+        if tz_fallback is not None:
+            logger.info(
+                "ZoneInfo indisponivel para '%s' neste ambiente; usando dateutil.tz.",
+                zone_name,
+            )
+            return tz_fallback
+
+        logger.warning(
+            "Timezone '%s' indisponivel no ambiente. Fallback para UTC-03:00 fixo.",
+            zone_name,
+        )
+        return timezone(timedelta(hours=-3), name="BRT")
+
+
+_FULL_SYNC_TZ = _resolve_full_sync_tz(FULL_SYNC_TIMEZONE)
 
 _MONTH_NUM_PT = {
     "jan.": 1, "fev.": 2, "mar.": 3, "abr.": 4,
@@ -95,6 +155,244 @@ def _extract_task_id_from_link(link: str) -> str:
         return link.split("/t/")[-1]
     return link
 
+
+def _parse_daily_time(value: str) -> tuple[int, int]:
+    raw = (value or "").strip()
+    try:
+        hour_s, minute_s = raw.split(":")
+        hour = int(hour_s)
+        minute = int(minute_s)
+        if 0 <= hour <= 23 and 0 <= minute <= 59:
+            return hour, minute
+    except Exception:
+        pass
+    logger.warning("FULL_SYNC_DAILY_TIME inválido (%s). Usando 00:10.", value)
+    return 0, 10
+
+
+_FULL_SYNC_DAILY_HOUR, _FULL_SYNC_DAILY_MINUTE = _parse_daily_time(FULL_SYNC_DAILY_TIME)
+
+
+def _next_full_sync_timestamp(now_local: datetime | None = None) -> float:
+    now = now_local or datetime.now(_FULL_SYNC_TZ)
+    candidate = now.replace(
+        hour=_FULL_SYNC_DAILY_HOUR,
+        minute=_FULL_SYNC_DAILY_MINUTE,
+        second=0,
+        microsecond=0,
+    )
+    if candidate <= now:
+        candidate = candidate + timedelta(days=1)
+    return candidate.timestamp()
+
+
+def _format_local_dt(ts: float) -> str:
+    return datetime.fromtimestamp(ts, _FULL_SYNC_TZ).strftime("%Y-%m-%d %H:%M:%S %Z")
+
+
+def _acquire_single_instance_lock() -> None:
+    global _LOCK_HANDLE
+    if _LOCK_HANDLE is not None:
+        return
+
+    lock_handle = open(_LOCK_FILE_PATH, "a+")
+    try:
+        lock_handle.seek(0)
+        lock_handle.truncate()
+        lock_handle.write(str(os.getpid()))
+        lock_handle.flush()
+
+        if msvcrt is not None:
+            lock_handle.seek(0)
+            msvcrt.locking(lock_handle.fileno(), msvcrt.LK_NBLCK, 1)
+        elif fcntl is not None:  # pragma: no cover
+            lock_handle.seek(0)
+            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        else:  # pragma: no cover
+            raise RuntimeError("Lock de processo não suportado neste ambiente.")
+    except Exception as exc:
+        try:
+            lock_handle.close()
+        except Exception:
+            pass
+        raise RuntimeError(
+            f"Já existe outra instância do sync em execução (lock: {_LOCK_FILE_PATH})."
+        ) from exc
+
+    _LOCK_HANDLE = lock_handle
+
+
+def _release_single_instance_lock() -> None:
+    global _LOCK_HANDLE
+    if _LOCK_HANDLE is None:
+        return
+    try:
+        if msvcrt is not None:
+            _LOCK_HANDLE.seek(0)
+            msvcrt.locking(_LOCK_HANDLE.fileno(), msvcrt.LK_UNLCK, 1)
+        elif fcntl is not None:  # pragma: no cover
+            fcntl.flock(_LOCK_HANDLE.fileno(), fcntl.LOCK_UN)
+    except Exception:
+        pass
+    try:
+        _LOCK_HANDLE.close()
+    finally:
+        _LOCK_HANDLE = None
+
+
+def _get_distributed_lock_worksheet():
+    ws_main = get_worksheet()
+    spreadsheet = ws_main.spreadsheet
+    try:
+        return spreadsheet.worksheet(DISTRIBUTED_LOCK_TAB_NAME)
+    except Exception:
+        ws_lock = spreadsheet.add_worksheet(title=DISTRIBUTED_LOCK_TAB_NAME, rows=5, cols=6)
+        logger.info("Aba de lock distribuido criada: %s", DISTRIBUTED_LOCK_TAB_NAME)
+        return ws_lock
+
+
+def _read_distributed_lock_state(ws_lock) -> tuple[str, float]:
+    row = ws_lock.row_values(1)
+    owner = row[0].strip() if len(row) >= 1 else ""
+    expires_raw = row[1].strip() if len(row) >= 2 else ""
+    try:
+        expires = float(expires_raw) if expires_raw else 0.0
+    except Exception:
+        expires = 0.0
+    return owner, expires
+
+
+def _write_distributed_lock_state(ws_lock, owner: str, expires_ts: float) -> None:
+    now_ts = time.time()
+    ws_lock.update(
+        range_name="A1:D1",
+        values=[[owner, f"{expires_ts:.3f}", f"{now_ts:.3f}", socket.gethostname()]],
+        value_input_option="RAW",
+    )
+
+
+def _acquire_distributed_lock() -> bool:
+    global _DLOCK_LAST_REFRESH_TS
+    if not DISTRIBUTED_LOCK_ENABLED:
+        return True
+
+    for attempt in range(1, 6):
+        now_ts = time.time()
+        ws_lock = _get_distributed_lock_worksheet()
+        owner, expires = _read_distributed_lock_state(ws_lock)
+
+        if owner and owner != _DLOCK_OWNER_ID and expires > now_ts:
+            logger.error(
+                "Lock distribuido ativo por outra instancia (owner=%s, expira_em=%.0f).",
+                owner,
+                expires,
+            )
+            return False
+
+        _write_distributed_lock_state(ws_lock, _DLOCK_OWNER_ID, now_ts + float(DISTRIBUTED_LOCK_TTL_S))
+        time.sleep(0.15)
+        owner_after, expires_after = _read_distributed_lock_state(ws_lock)
+        if owner_after == _DLOCK_OWNER_ID and expires_after > now_ts:
+            _DLOCK_LAST_REFRESH_TS = now_ts
+            logger.info("Lock distribuido adquirido (owner=%s).", _DLOCK_OWNER_ID)
+            return True
+
+        time.sleep(0.2 * attempt)
+
+    logger.error("Falha ao adquirir lock distribuido apos retries.")
+    return False
+
+
+def _refresh_distributed_lock_if_needed(force: bool = False) -> None:
+    global _DLOCK_LAST_REFRESH_TS, _shutdown_requested
+    if not DISTRIBUTED_LOCK_ENABLED:
+        return
+
+    now_ts = time.time()
+    if not force and (now_ts - _DLOCK_LAST_REFRESH_TS) < max(10, DISTRIBUTED_LOCK_REFRESH_S):
+        return
+
+    ws_lock = _get_distributed_lock_worksheet()
+    owner, expires = _read_distributed_lock_state(ws_lock)
+    if owner and owner != _DLOCK_OWNER_ID and expires > now_ts:
+        _shutdown_requested = True
+        raise RuntimeError(
+            f"Lock distribuido foi tomado por outra instancia (owner={owner}). Encerrando para evitar concorrencia."
+        )
+
+    _write_distributed_lock_state(ws_lock, _DLOCK_OWNER_ID, now_ts + float(DISTRIBUTED_LOCK_TTL_S))
+    _DLOCK_LAST_REFRESH_TS = now_ts
+
+
+def _release_distributed_lock() -> None:
+    if not DISTRIBUTED_LOCK_ENABLED:
+        return
+    try:
+        ws_lock = _get_distributed_lock_worksheet()
+        owner, _ = _read_distributed_lock_state(ws_lock)
+        if owner == _DLOCK_OWNER_ID:
+            _write_distributed_lock_state(ws_lock, "", 0.0)
+            logger.info("Lock distribuido liberado.")
+    except Exception:
+        logger.warning("Falha ao liberar lock distribuido.", exc_info=True)
+
+
+def _rehydrate_known_task_ids_from_sheet() -> int:
+    global _known_task_ids
+    ws = get_worksheet()
+    ensure_headers(ws)
+    headers = get_headers()
+    task_id_col = headers.index("Task ID")
+    task_id_values = read_column_values(ws, task_id_col)
+
+    restored = 0
+    for cell_value in task_id_values:
+        tid = _extract_task_id_from_link(str(cell_value).strip())
+        if not tid or tid in _known_task_ids:
+            continue
+        _known_task_ids.add(tid)
+        restored += 1
+
+    logger.info("Reidratação _known_task_ids: %d IDs recuperados da planilha.", restored)
+    return restored
+
+
+def _run_full_sync_until_success(
+    *,
+    reason: str,
+) -> bool:
+    attempt = 0
+    while not _shutdown_requested:
+        attempt += 1
+
+        try:
+            _refresh_distributed_lock_if_needed(force=True)
+            full_sync()
+            return True
+        except MemoryError:
+            end_memory_cycle("FULL SYNC")
+            logger.critical(
+                "MemoryError no full sync (%s, tentativa %d).",
+                reason,
+                attempt,
+            )
+        except Exception:
+            end_memory_cycle("FULL SYNC")
+            logger.exception(
+                "Erro no full sync (%s, tentativa %d).",
+                reason,
+                attempt,
+            )
+
+        _reset_all_sessions(f"full_sync_{reason}_tentativa_{attempt}")
+        wait_s = min(
+            FULL_SYNC_RETRY_BASE_S * (2 ** max(attempt - 1, 0)),
+            FULL_SYNC_RETRY_MAX_S,
+        )
+        logger.warning("Full sync (%s) retry em %ds.", reason, int(wait_s))
+        _interruptible_sleep(wait_s)
+
+    return False
 
 _STATUS_TROCA_PLANO = "25a28dc4-16ff-4ecf-b94f-a7b3a6eef42c"
 _STATUS_CF_ID = "1a5118f7-b9a0-466f-889d-37edd76bd304"
@@ -214,7 +512,7 @@ def _resolve_task_for_month(
     # Verificar se há troca de plano envolvida
     has_troca = any(_is_troca_plano(t) for t in task_list)
     if not has_troca:
-        # Sem troca de plano — retorna a última (comportamento original)
+        # comentario normalizado
         return task_list[-1]
 
     # Converter referenceMonth para comparação
@@ -243,18 +541,21 @@ def _resolve_task_for_month(
             if fim_ym < ref_date:
                 continue  # task já encerrou antes desse mês
 
-        # Task é válida — guardar a mais recente (lista está ordenada por inicio)
+        # comentario normalizado
         best = task
 
     if best is not None:
         return best
 
-    # Nenhuma task cobre o mês — usar a última (mais recente/ativa)
+    # comentario normalizado
     return task_list[-1]
 
 
 def _get_powerrev_date_range(tasks: list[dict]) -> tuple[str, str]:
     """Determina range de meses para consultar PowerRev baseado em inicio_operacao."""
+    if POWERREV_REFERENCE_MONTH_ONLY and len(POWERREV_REFERENCE_MONTH_ONLY) == 6:
+        return POWERREV_REFERENCE_MONTH_ONLY, POWERREV_REFERENCE_MONTH_ONLY
+
     min_date: datetime | None = None
     for task in tasks:
         dt = get_inicio_operacao(task)
@@ -338,6 +639,7 @@ def _fetch_invoices_grouped(
     end_month = int(end_ym[4:6])
 
     while (year < end_year) or (year == end_year and month <= end_month):
+        _refresh_distributed_lock_if_needed()
         ref = f"{year}{month:02d}"
         attempt = 0
         while True:
@@ -370,6 +672,7 @@ def _fetch_invoices_grouped(
                     "PowerRev falhou para %s (tentativa %d/3). Aguardando %ds e retry do mesmo mês.",
                     ref, attempt + 1, wait_s,
                 )
+                _refresh_distributed_lock_if_needed(force=True)
                 time.sleep(wait_s)
 
         month += 1
@@ -495,7 +798,7 @@ def _build_rows_from_invoices(
             if rm and rm not in unique_months:
                 unique_months.append(rm)
 
-        # Gerar linhas reais — resolver task correta por mês
+        # comentario normalizado
         for inv in invoices:
             rm = inv.get("referenceMonth", "")
             mes_atendimento = unique_months.index(rm) + 1 if rm in unique_months else 0
@@ -514,7 +817,7 @@ def _build_rows_from_invoices(
             "referenceMonth": placeholder_ym,
             "status": "",
             "issueDate": "",
-            "total": "R$0,00",
+            "total": 0.0,
         }
         mes_atendimento = len(unique_months) + 1
         # Placeholder usa a task mais recente (ativa)
@@ -532,24 +835,26 @@ def _build_rows_from_invoices(
 
 def _delta_powerrev_check(ws, headers: list[str]) -> None:
     """
-    Checa mês anterior, atual e próximo na PowerRev.
-    Atualiza N, O, P em linhas existentes.
-    Limpa Q se invoice chegou (resolve "Erro no sistema" e "Não processado").
+    Check previous/current/next month in PowerRev and update existing rows only.
     """
     from powerrev_client import fetch_invoices_for_month, _load_consumer_units
+    from sheets_manager import _derive_invoice_id_from_row
 
-    now = datetime.now()
-    months_to_check = []
-    for delta in (-1, 0, 1):
-        m = now.month + delta
-        y = now.year
-        if m > 12:
-            m -= 12
-            y += 1
-        elif m < 1:
-            m += 12
-            y -= 1
-        months_to_check.append(f"{y}{m:02d}")
+    if POWERREV_REFERENCE_MONTH_ONLY and len(POWERREV_REFERENCE_MONTH_ONLY) == 6:
+        months_to_check = [POWERREV_REFERENCE_MONTH_ONLY]
+    else:
+        now = datetime.now()
+        months_to_check = []
+        for delta in (-1, 0, 1):
+            m = now.month + delta
+            y = now.year
+            if m > 12:
+                m -= 12
+                y += 1
+            elif m < 1:
+                m += 12
+                y -= 1
+            months_to_check.append(f"{y}{m:02d}")
 
     logger.info("Delta PowerRev: checando meses %s", ", ".join(months_to_check))
 
@@ -573,56 +878,202 @@ def _delta_powerrev_check(ws, headers: list[str]) -> None:
     emissao_col = headers.index("Data de Emissão da fatura")
     valor_col = headers.index("Valor do boleto")
     val_col = headers.index("Validação")
+    invoice_col = headers.index("Invoice ID") if "Invoice ID" in headers else None
+    provider_col = headers.index("Provider") if "Provider" in headers else None
+    parent_col = headers.index("Parentesco agrupado") if "Parentesco agrupado" in headers else None
 
-    existing_keys: dict[tuple[str, str], int] = {}
-    # Rastrear linhas com Q marcado ("Erro no sistema" ou "Não processado")
-    marked_rows: dict[tuple[str, str], int] = {}
-    for i, row in enumerate(existing_rows):
-        if len(row) > max(uc_col, mes_col):
-            uc = str(row[uc_col]).strip()
-            mes = str(row[mes_col]).strip()
-            yyyymm = label_to_yyyymm(mes)
-            if uc and yyyymm:
-                existing_keys[(uc, yyyymm)] = i + 2
-                val_q = str(row[val_col]).strip() if len(row) > val_col else ""
-                if val_q in (_ERRO_SISTEMA, _NAO_PROCESSADO):
-                    marked_rows[(uc, yyyymm)] = i + 2
+    months_to_check_set = set(months_to_check)
 
-    updates: dict[int, dict[int, str]] = {}
-    new_count = 0
+    def _fallback_key_delta(uc: str, yyyymm: str) -> str:
+        if not uc or not yyyymm:
+            return ""
+        return f"{uc}|{yyyymm}"
 
-    for inv in all_invoices:
-        uc = inv.get("uc", "").strip()
-        ref = inv.get("referenceMonth", "").strip()
+    def _primary_key_delta(uc: str, yyyymm: str, invoice_id: str) -> str:
+        if not uc or not yyyymm or not invoice_id:
+            return ""
+        return f"{uc}|{yyyymm}|{invoice_id}"
+
+    def _money_token(value: object) -> str:
+        text = str(value or "").strip()
+        if not text:
+            return ""
+        cleaned = re.sub(r"[^0-9,.\-]", "", text)
+        if not cleaned:
+            return ""
+        if "," in cleaned and "." in cleaned:
+            if cleaned.rfind(",") > cleaned.rfind("."):
+                cleaned = cleaned.replace(".", "").replace(",", ".")
+            else:
+                cleaned = cleaned.replace(",", "")
+        elif "," in cleaned:
+            cleaned = cleaned.replace(".", "").replace(",", ".")
+        try:
+            return f"{float(cleaned):.2f}"
+        except (TypeError, ValueError):
+            return cleaned
+
+    def _secondary_key_delta(
+        uc: str,
+        yyyymm: str,
+        parent_grouped_uc: str,
+        issue_date: str,
+        provider_name: str,
+        status: str,
+        total: object,
+    ) -> str:
+        if not uc or not yyyymm:
+            return ""
+        total_token = _money_token(total)
+        return "|".join([
+            "SKD",
+            uc.strip(),
+            yyyymm.strip(),
+            str(parent_grouped_uc or "").strip(),
+            str(issue_date or "").strip(),
+            str(provider_name or "").strip(),
+            str(status or "").strip(),
+            total_token,
+        ])
+
+    def _pop_unmatched(queue_map: dict[str, deque[int]], key: str, consumed: set[int]) -> int | None:
+        if not key:
+            return None
+        q = queue_map.get(key)
+        if not q:
+            return None
+        while q and q[0] in consumed:
+            q.popleft()
+        if not q:
+            return None
+        idx = q.popleft()
+        consumed.add(idx)
+        return idx
+
+    def _pop_unique_unmatched(queue_map: dict[str, deque[int]], key: str, consumed: set[int]) -> int | None:
+        if not key:
+            return None
+        q = queue_map.get(key)
+        if not q:
+            return None
+        unmatched = [idx for idx in q if idx not in consumed]
+        if len(unmatched) != 1:
+            return None
+        idx = unmatched[0]
+        consumed.add(idx)
+        return idx
+
+    inv_primary_map: dict[str, deque[int]] = defaultdict(deque)
+    inv_fallback_map: dict[str, deque[int]] = defaultdict(deque)
+    inv_secondary_map: dict[str, deque[int]] = defaultdict(deque)
+    for idx, inv in enumerate(all_invoices):
+        uc = str(inv.get("uc", "")).strip()
+        ref = str(inv.get("referenceMonth", "")).strip()
+        inv_id = str(inv.get("invoiceId", "")).strip()
         if not uc or not ref:
             continue
+        fallback = _fallback_key_delta(uc, ref)
+        primary = _primary_key_delta(uc, ref, inv_id)
+        secondary = str(inv.get("rowKey") or "").strip() or _secondary_key_delta(
+            uc=uc,
+            yyyymm=ref,
+            parent_grouped_uc=inv.get("parentGroupedUc", ""),
+            issue_date=inv.get("issueDate", ""),
+            provider_name=inv.get("providerName", ""),
+            status=inv.get("status", ""),
+            total=inv.get("total", ""),
+        )
+        if primary:
+            inv_primary_map[primary].append(idx)
+        if fallback:
+            inv_fallback_map[fallback].append(idx)
+        if secondary:
+            inv_secondary_map[secondary].append(idx)
 
-        sheet_row = existing_keys.get((uc, ref))
+    compact_sheet_rows: list[tuple[int, str, str, str, str, str]] = []
+    required_len = max(uc_col, mes_col)
+    for i, row in enumerate(existing_rows):
+        if len(row) <= required_len:
+            continue
 
-        if sheet_row is not None:
-            col_updates: dict[int, str] = {}
-            if inv.get("status"):
-                col_updates[status_fat_col] = inv["status"]
-            if inv.get("issueDate"):
-                col_updates[emissao_col] = inv["issueDate"]
-            if inv.get("total"):
-                col_updates[valor_col] = inv["total"]
-            # Se linha tinha marcação Q e invoice chegou, limpar Q
-            if (uc, ref) in marked_rows:
-                col_updates[val_col] = ""
-            if col_updates:
-                updates[sheet_row] = col_updates
+        uc = str(row[uc_col]).strip()
+        mes = str(row[mes_col]).strip()
+        ref = label_to_yyyymm(mes)
+        if not uc or not ref or ref not in months_to_check_set:
+            continue
+
+        current_q = str(row[val_col]).strip() if len(row) > val_col else ""
+        invoice_id = _derive_invoice_id_from_row(
+            row,
+            uc_col=uc_col,
+            invoice_id_col=invoice_col,
+            provider_col=provider_col,
+            issue_col=emissao_col,
+            parent_col=parent_col,
+        )
+        row_secondary = _secondary_key_delta(
+            uc=uc,
+            yyyymm=ref,
+            parent_grouped_uc=(row[parent_col] if parent_col is not None and len(row) > parent_col else ""),
+            issue_date=(row[emissao_col] if len(row) > emissao_col else ""),
+            provider_name=(row[provider_col] if provider_col is not None and len(row) > provider_col else ""),
+            status=(row[status_fat_col] if len(row) > status_fat_col else ""),
+            total=(row[valor_col] if len(row) > valor_col else ""),
+        )
+        compact_sheet_rows.append((i + 2, uc, ref, current_q, invoice_id, row_secondary))
+
+    del existing_rows
+
+    updates: dict[int, dict[int, str]] = {}
+    consumed_invoices: set[int] = set()
+
+    for sheet_row, uc, ref, current_q, invoice_id, row_secondary in compact_sheet_rows:
+        primary = _primary_key_delta(uc, ref, invoice_id)
+        fallback = _fallback_key_delta(uc, ref)
+
+        match_idx = None
+        if primary:
+            match_idx = _pop_unmatched(inv_primary_map, primary, consumed_invoices)
+            if match_idx is None and invoice_id.startswith("SYN|"):
+                match_idx = _pop_unique_unmatched(inv_secondary_map, row_secondary, consumed_invoices)
+            if match_idx is None and invoice_id.startswith("SYN|"):
+                match_idx = _pop_unique_unmatched(inv_fallback_map, fallback, consumed_invoices)
         else:
-            new_count += 1
+            match_idx = _pop_unique_unmatched(inv_secondary_map, row_secondary, consumed_invoices)
+            if match_idx is None:
+                match_idx = _pop_unique_unmatched(inv_fallback_map, fallback, consumed_invoices)
+
+        if match_idx is None:
+            if current_q != _NAO_PROCESSADO:
+                updates.setdefault(sheet_row, {})[val_col] = _ERRO_SISTEMA
+            continue
+
+        inv = all_invoices[match_idx]
+        col_updates: dict[int, str | float] = {}
+        col_updates[status_fat_col] = inv.get("status") or ""
+        col_updates[emissao_col] = inv.get("issueDate") or ""
+        total_val = inv.get("total")
+        col_updates[valor_col] = "" if total_val is None else total_val
+        col_updates[val_col] = ""
+        updates[sheet_row] = col_updates
 
     if updates:
         update_columns_in_place(ws, updates)
-        # Contar quantas tinham Q limpo
-        q_cleared = sum(1 for sr, cols in updates.items() if val_col in cols and cols[val_col] == "")
-        if q_cleared:
-            logger.info("Delta PowerRev: %d linhas atualizadas (%d com Q limpo)", len(updates), q_cleared)
-        else:
-            logger.info("Delta PowerRev: %d linhas atualizadas", len(updates))
+        q_cleared = sum(1 for cols in updates.values() if val_col in cols and cols[val_col] == "")
+        q_erro = sum(1 for cols in updates.values() if val_col in cols and cols[val_col] == _ERRO_SISTEMA)
+        logger.info(
+            "Delta PowerRev: %d linhas atualizadas (%d Q limpo, %d Q erro).",
+            len(updates),
+            q_cleared,
+            q_erro,
+        )
+
+    new_count = sum(
+        1 for idx, inv in enumerate(all_invoices)
+        if str(inv.get("uc", "")).strip()
+        and str(inv.get("referenceMonth", "")).strip() in months_to_check_set
+        and idx not in consumed_invoices
+    )
 
     if new_count:
         logger.info(
@@ -630,27 +1081,27 @@ def _delta_powerrev_check(ws, headers: list[str]) -> None:
             new_count,
         )
 
-    del existing_rows, all_invoices
+    del compact_sheet_rows, inv_primary_map, inv_fallback_map, inv_secondary_map, consumed_invoices, updates, all_invoices
+    force_free_memory()
 
 
 def _delta_clickup_update(ws, headers: list[str], updated_tasks: list[dict]) -> None:
     """
     Atualiza campos do ClickUp nas linhas existentes.
-    Toca colunas ClickUp (B, D, I, J, K, L), preserva o resto.
+    Toca colunas ClickUp (B, D, I, J, K, S), preserva o resto.
     """
     if not updated_tasks:
         return
 
-    existing_rows = read_all_rows(ws)
     task_id_col = headers.index("Task ID")
+    task_id_values = read_column_values(ws, task_id_col)
 
-    # Mapear task_id → linhas na planilha
+    # Mapear task_id para linhas na planilha
     task_rows: dict[str, list[int]] = {}
-    for i, row in enumerate(existing_rows):
-        if len(row) > task_id_col:
-            tid = _extract_task_id_from_link(str(row[task_id_col]))
-            if tid:
-                task_rows.setdefault(tid, []).append(i + 2)
+    for i, cell_value in enumerate(task_id_values):
+        tid = _extract_task_id_from_link(str(cell_value))
+        if tid:
+            task_rows.setdefault(tid, []).append(i + 2)
 
     # Colunas ClickUp a atualizar
     status_col = headers.index("Status Detalhado")
@@ -680,8 +1131,8 @@ def _delta_clickup_update(ws, headers: list[str], updated_tasks: list[dict]) -> 
         values: dict[int, str] = {}
         for key, col_idx in clickup_cols.items():
             val = _extract_field_value(task, key)
-            if val:
-                values[col_idx] = val
+            # Requisito: valores vazios também devem atualizar (limpar célula).
+            values[col_idx] = val if val is not None else ""
         # Observações: campo computed, precisa de lógica própria
         obs_val = _build_observacoes(task)
         values[obs_col] = obs_val  # sempre atualizar (pode limpar)
@@ -694,7 +1145,8 @@ def _delta_clickup_update(ws, headers: list[str], updated_tasks: list[dict]) -> 
         update_columns_in_place(ws, updates)
         logger.info("Delta ClickUp: %d linhas atualizadas", len(updates))
 
-    del existing_rows
+    del task_id_values, task_rows, updates
+    force_free_memory()
 
 
 def _merge_with_disappeared(
@@ -705,33 +1157,104 @@ def _merge_with_disappeared(
 ) -> tuple[list[list[str]], dict[int, dict[int, str]], list[list[str]]]:
     """
     Preserva linhas cujo invoice sumiu da PowerRev.
-    Q = "Erro no sistema" para desaparecidos.
-    Q de reaparecidos já é "" (escrito por build_row/write_all_rows).
+    "Validação" = "Erro no sistema" para desaparecidos.
+    "Validação" de reaparecidos já é "" (escrito por build_row/write_all_rows).
 
     Retorna (merged_rows, q_marks_desaparecidos, existing_rows).
     existing_rows é repassado a write_all_rows para evitar leitura duplicada.
     """
-    from sheets_manager import WRITE_COL_COUNT
+    from collections import defaultdict, deque
+    from sheets_manager import (
+        WRITE_COL_COUNT,
+        _derive_invoice_id_from_row,
+        _fallback_key,
+        _primary_key,
+    )
 
     uc_idx = headers.index("UC")
     mes_idx = headers.index("Mês de Referencia")
     val_idx = headers.index("Validação")
+    status_fat_idx = headers.index("Status de faturamento")
+    valor_idx = headers.index("Valor do boleto")
+    obs_idx = headers.index("Observações")
+    val_final_idx = headers.index("Valor final")
+    emiss_final_idx = headers.index("Data de emissão final")
+
+    invoice_idx = headers.index("Invoice ID") if "Invoice ID" in headers else None
+    provider_idx = headers.index("Provider") if "Provider" in headers else None
+    issue_idx = headers.index("Data de Emissão da fatura") if "Data de Emissão da fatura" in headers else None
+    parent_idx = headers.index("Parentesco agrupado") if "Parentesco agrupado" in headers else None
+
+    def _row_value_local(row: list[str], idx: int | None) -> str:
+        if idx is None or idx < 0 or len(row) <= idx:
+            return ""
+        return str(row[idx]).strip()
+
+    def _money_token(value: object) -> str:
+        text = str(value or "").strip()
+        if not text:
+            return ""
+        cleaned = re.sub(r"[^0-9,.\-]", "", text)
+        if not cleaned:
+            return ""
+        if "," in cleaned and "." in cleaned:
+            if cleaned.rfind(",") > cleaned.rfind("."):
+                cleaned = cleaned.replace(".", "").replace(",", ".")
+            else:
+                cleaned = cleaned.replace(",", "")
+        elif "," in cleaned:
+            cleaned = cleaned.replace(".", "").replace(",", ".")
+        try:
+            return f"{float(cleaned):.2f}"
+        except (TypeError, ValueError):
+            return cleaned
+
+    def _secondary_key_local(row: list[str], *, yyyymm: str) -> str:
+        uc = _row_value_local(row, uc_idx)
+        if not uc or not yyyymm:
+            return ""
+        parent = _row_value_local(row, parent_idx)
+        issue = _row_value_local(row, issue_idx)
+        provider = _row_value_local(row, provider_idx)
+        status = _row_value_local(row, status_fat_idx)
+        total = _money_token(_row_value_local(row, valor_idx))
+        return "|".join([
+            "SKD",
+            uc,
+            yyyymm,
+            parent,
+            issue,
+            provider,
+            status,
+            total,
+        ])
+
+    def _row_keys(row: list[str]) -> tuple[str, str, str, str]:
+        uc = _row_value_local(row, uc_idx)
+        mes = _row_value_local(row, mes_idx)
+        if not uc or not mes:
+            return "", "", "", ""
+        invoice_id = _derive_invoice_id_from_row(
+            row,
+            uc_col=uc_idx,
+            invoice_id_col=invoice_idx,
+            provider_col=provider_idx,
+            issue_col=issue_idx,
+            parent_col=parent_idx,
+        )
+        yyyymm = label_to_yyyymm(mes)
+        secondary_key = _secondary_key_local(row, yyyymm=yyyymm)
+        return _fallback_key(uc, mes), _primary_key(uc, mes, invoice_id), invoice_id, secondary_key
+
+    def _has_protected_values(row: list[str]) -> bool:
+        for idx in (obs_idx, val_final_idx, emiss_final_idx):
+            if len(row) > idx and str(row[idx]).strip():
+                return True
+        return False
 
     existing = read_all_rows(ws)
     if not existing:
         return new_rows, {}, existing
-
-    # Chaves dos dados novos
-    new_keys: set[tuple[str, str]] = set()
-    for row in new_rows:
-        uc = str(row[uc_idx]).strip() if len(row) > uc_idx else ""
-        mes = str(row[mes_idx]).strip() if len(row) > mes_idx else ""
-        if uc and mes:
-            new_keys.add((uc, mes))
-
-    # Detectar desaparecidos
-    disappeared_by_uc: dict[str, list[list[str]]] = {}
-    disappeared_keys: set[tuple[str, str]] = set()
 
     def _is_within_uc_period(uc: str, yyyymm: str) -> bool:
         if not uc_to_tasks:
@@ -761,7 +1284,6 @@ def _merge_with_disappeared(
         if has_open_end:
             fim_global = None
 
-        # Comparação por YYYYMM
         if inicio_global is not None:
             inicio_ym = f"{inicio_global.year}{inicio_global.month:02d}"
             if yyyymm < inicio_ym:
@@ -774,37 +1296,108 @@ def _merge_with_disappeared(
 
         return True
 
+    # comentario normalizado
+    new_primary_map: dict[str, deque[int]] = defaultdict(deque)
+    new_fallback_map: dict[str, deque[int]] = defaultdict(deque)
+    new_fallback_any_map: dict[str, deque[int]] = defaultdict(deque)
+    new_secondary_map: dict[str, deque[int]] = defaultdict(deque)
+    for idx, row in enumerate(new_rows):
+        fallback_key, primary_key, _, secondary_key = _row_keys(row)
+        if primary_key:
+            new_primary_map[primary_key].append(idx)
+        if fallback_key and (not primary_key):
+            new_fallback_map[fallback_key].append(idx)
+        if fallback_key:
+            new_fallback_any_map[fallback_key].append(idx)
+        if secondary_key:
+            new_secondary_map[secondary_key].append(idx)
+
+    consumed_new: set[int] = set()
+
+    def _pop_unmatched(queue_map: dict[str, deque[int]], key: str) -> int | None:
+        if not key:
+            return None
+        q = queue_map.get(key)
+        if not q:
+            return None
+        while q and q[0] in consumed_new:
+            q.popleft()
+        if not q:
+            return None
+        idx = q.popleft()
+        consumed_new.add(idx)
+        return idx
+
+    def _pop_unique_unmatched(queue_map: dict[str, deque[int]], key: str) -> int | None:
+        if not key:
+            return None
+        q = queue_map.get(key)
+        if not q:
+            return None
+        unmatched = [idx for idx in q if idx not in consumed_new]
+        if len(unmatched) != 1:
+            return None
+        idx = unmatched[0]
+        consumed_new.add(idx)
+        return idx
+
+    disappeared_by_uc: dict[str, list[list[str]]] = {}
+    disappeared_row_ids: set[int] = set()
+
     for row in existing:
-        uc = str(row[uc_idx]).strip() if len(row) > uc_idx else ""
-        mes = str(row[mes_idx]).strip() if len(row) > mes_idx else ""
+        uc = _row_value_local(row, uc_idx)
+        mes = _row_value_local(row, mes_idx)
         if not uc or not mes:
             continue
-        if (uc, mes) not in new_keys:
-            # Se a linha está fora do período da UC, não deve ser preservada
-            yyyymm = label_to_yyyymm(mes)
-            if yyyymm and not _is_within_uc_period(uc, yyyymm):
-                continue
-            # Preservar A-Q, mas forçar Q="" (será marcado via q_marks)
-            preserved = [str(v) for v in row[:WRITE_COL_COUNT]]
-            while len(preserved) < WRITE_COL_COUNT:
-                preserved.append("")
-            preserved[val_idx] = ""  # q_marks cuida do Q depois
-            disappeared_by_uc.setdefault(uc, []).append(preserved)
-            disappeared_keys.add((uc, mes))
 
-    if not disappeared_keys:
+        fallback_key, primary_key, invoice_id, secondary_key = _row_keys(row)
+
+        # Regra de identidade estrita:
+        # - linhas com primary key só casam por primary key
+        # - fallback UC|Mes só é permitido para linhas sem primary key
+        match_idx = None
+        if primary_key:
+            match_idx = _pop_unmatched(new_primary_map, primary_key)
+            if match_idx is None and invoice_id.startswith("SYN|"):
+                match_idx = _pop_unique_unmatched(new_secondary_map, secondary_key)
+            if match_idx is None and invoice_id.startswith("SYN|"):
+                match_idx = _pop_unique_unmatched(new_fallback_any_map, fallback_key)
+        else:
+            match_idx = _pop_unique_unmatched(new_secondary_map, secondary_key)
+            if match_idx is None:
+                match_idx = _pop_unmatched(new_fallback_map, fallback_key)
+            if match_idx is None:
+                match_idx = _pop_unique_unmatched(new_fallback_any_map, fallback_key)
+
+        if match_idx is not None:
+            continue  # linha existente já foi correspondida com linha nova
+
+        yyyymm = label_to_yyyymm(mes)
+        has_protected = _has_protected_values(row)
+
+        # Requisito crítico: se L/N/P já teve valor, a linha deve permanecer sempre.
+        if (not has_protected) and yyyymm and (not _is_within_uc_period(uc, yyyymm)):
+            continue
+
+        preserved = [str(v) for v in row[:WRITE_COL_COUNT]]
+        while len(preserved) < WRITE_COL_COUNT:
+            preserved.append("")
+        preserved[val_idx] = ""  # q_marks escreve o status de erro depois
+        disappeared_by_uc.setdefault(uc, []).append(preserved)
+        disappeared_row_ids.add(id(preserved))
+
+    if not disappeared_row_ids:
         return new_rows, {}, existing
 
     logger.warning(
-        "Integridade PowerRev: %d linhas sumiram — preservando com '%s' em Q.",
-        len(disappeared_keys), _ERRO_SISTEMA,
+        "Integridade PowerRev: %d linhas sumiram - preservando com '%s' em Q.",
+        len(disappeared_row_ids), _ERRO_SISTEMA,
     )
 
-    # Inserir desaparecidos junto à mesma UC, ordenados por mês
     rows_by_uc: dict[str, list[list[str]]] = {}
     uc_order: list[str] = []
     for row in new_rows:
-        uc = str(row[uc_idx]).strip() if len(row) > uc_idx else ""
+        uc = _row_value_local(row, uc_idx)
         if uc and uc not in rows_by_uc:
             uc_order.append(uc)
         rows_by_uc.setdefault(uc, []).append(row)
@@ -820,12 +1413,9 @@ def _merge_with_disappeared(
     for uc in uc_order:
         merged.extend(rows_by_uc.get(uc, []))
 
-    # q_marks: marcar Q = "Erro no sistema" apenas para desaparecidos
     q_marks: dict[int, dict[int, str]] = {}
     for i, row in enumerate(merged):
-        uc = str(row[uc_idx]).strip() if len(row) > uc_idx else ""
-        mes = str(row[mes_idx]).strip() if len(row) > mes_idx else ""
-        if (uc, mes) in disappeared_keys:
+        if id(row) in disappeared_row_ids:
             q_marks[i + 2] = {val_idx: _ERRO_SISTEMA}
 
     return merged, q_marks, existing
@@ -834,8 +1424,10 @@ def _merge_with_disappeared(
 def full_sync() -> None:
     global _known_task_ids
     stats.reset()
+    begin_memory_cycle("FULL SYNC")
+    _refresh_distributed_lock_if_needed(force=True)
 
-    logger.info("═══ FULL SYNC início ═══")
+    logger.info("=== FULL SYNC inicio ===")
     log_memory("FULL SYNC início")
     t0 = time.time()
 
@@ -863,6 +1455,8 @@ def full_sync() -> None:
     fallback_seen = 0
     for t in iter_team_tasks_with_uc(uc_cf_id):
         fallback_seen += 1
+        if fallback_seen % 500 == 0:
+            _refresh_distributed_lock_if_needed()
         # Só aceitar tasks cuja home list está nas listas permitidas
         task_list_id = t.get("list", {}).get("id", "")
         if task_list_id not in allowed_lists:
@@ -880,7 +1474,7 @@ def full_sync() -> None:
             _known_task_ids.add(tid)
             fallback_count += 1
         else:
-            # Evitar duplicatas — só adicionar se task_id é novo
+            # comentario normalizado
                 existing_ids = {et.get("id", "") for et in uc_to_task[uc]}
                 if tid not in existing_ids:
                     uc_to_task[uc].append(slimmed)
@@ -914,15 +1508,17 @@ def full_sync() -> None:
     if POWERREV_BASE_URL:
         allowed_ucs = set(uc_to_task.keys())
         uc_periods = _build_uc_periods(uc_to_task)
+        _refresh_distributed_lock_if_needed(force=True)
         uc_invoices = _fetch_invoices_grouped(
             start_ym,
             end_ym,
             allowed_ucs=allowed_ucs,
             uc_periods=uc_periods,
         )
+        _refresh_distributed_lock_if_needed(force=True)
         log_memory("Pós-fetch PowerRev")
     else:
-        logger.warning("PowerRev não configurada — nenhuma linha será gerada.")
+        logger.warning("PowerRev nao configurada - nenhuma linha sera gerada.")
         uc_invoices = {}
 
     if not uc_invoices:
@@ -932,14 +1528,19 @@ def full_sync() -> None:
         headers = get_headers()
         # Sem dados novos, mas preservar linhas existentes como "Erro no sistema"
         rows_empty: list[list[str]] = []
-        rows_empty, q_marks, _ = _merge_with_disappeared(rows_empty, ws, headers, uc_to_task)
+        rows_empty, q_marks, existing_rows = _merge_with_disappeared(rows_empty, ws, headers, uc_to_task)
         if rows_empty:
-            write_all_rows(ws, rows_empty)
+            write_all_rows(
+                ws,
+                rows_empty,
+                existing_data_rows=existing_rows,
+            )
             if q_marks:
                 update_columns_in_place(ws, q_marks)
                 logger.info("Integridade: %d marcações Q aplicadas.", len(q_marks))
         force_free_memory()
         log_sync_stats("FULL SYNC (sem dados novos)")
+        end_memory_cycle("FULL SYNC")
         return
 
     # 6. Montar linhas (invoice = linha, enriquecido com ClickUp) + placeholders
@@ -953,7 +1554,7 @@ def full_sync() -> None:
 
     # Detectar invoices que sumiram e preservar suas linhas
     rows_before = len(rows)
-    rows, q_marks, _ = _merge_with_disappeared(rows, ws, headers, uc_to_task)
+    rows, q_marks, existing_rows = _merge_with_disappeared(rows, ws, headers, uc_to_task)
 
     del uc_invoices, uc_to_task
     force_free_memory()
@@ -974,7 +1575,12 @@ def full_sync() -> None:
             if (uc, mes) in placeholder_keys:
                 q_marks[i + 2] = {val_idx: _NAO_PROCESSADO}
 
-    write_all_rows(ws, rows)
+    write_all_rows(
+        ws,
+        rows,
+        existing_data_rows=existing_rows,
+    )
+    _refresh_distributed_lock_if_needed(force=True)
 
     # Aplicar marcações na coluna Q (Validação)
     if q_marks:
@@ -983,7 +1589,7 @@ def full_sync() -> None:
 
     elapsed = time.time() - t0
     logger.info(
-        "═══ FULL SYNC concluído em %.1fs — %d linhas, %d tasks ═══",
+        "=== FULL SYNC concluido em %.1fs - %d linhas, %d tasks ===",
         elapsed, len(rows), len(_known_task_ids),
     )
 
@@ -992,11 +1598,14 @@ def full_sync() -> None:
 
     log_sync_stats("FULL SYNC")
     log_memory("Pós-gc final")
+    end_memory_cycle("FULL SYNC")
 
 
 def delta_sync(last_updated_ts: int) -> int:
     global _known_task_ids
     stats.reset()
+    begin_memory_cycle("DELTA SYNC")
+    _refresh_distributed_lock_if_needed(force=True)
     now_ms = int(time.time() * 1000)
 
     tasks = fetch_all_tasks(
@@ -1009,7 +1618,13 @@ def delta_sync(last_updated_ts: int) -> int:
     ensure_headers(ws)
     headers = get_headers()
 
-    # ── 1) Tasks atualizadas do ClickUp ───────────────────
+    if not _known_task_ids:
+        try:
+            _rehydrate_known_task_ids_from_sheet()
+        except Exception:
+            logger.exception("Delta: falha ao reidratar _known_task_ids da planilha.")
+
+    # comentario normalizado
     if tasks:
         new_tasks = []
         updated_tasks = []
@@ -1042,12 +1657,15 @@ def delta_sync(last_updated_ts: int) -> int:
     else:
         del tasks
 
-    # ── 2) PowerRev: checar 3 meses ──────────────────────
+    # comentario normalizado
     if POWERREV_BASE_URL:
         _delta_powerrev_check(ws, headers)
 
+    del ws, headers
     log_sync_stats("DELTA SYNC")
     force_free_memory()
+    log_memory("DELTA pós-gc final")
+    end_memory_cycle("DELTA SYNC")
 
     return now_ms
 
@@ -1070,31 +1688,43 @@ def main() -> None:
     logger.info("Faturamento Sync iniciando (PID %d)...", os.getpid())
     log_memory("Boot")
 
-    # ── Full sync inicial ────────────────────────────────
-    initial_ok = False
-    for attempt in range(3):
-        if _shutdown_requested:
-            logger.info("Shutdown antes do full sync inicial.")
-            return
-        try:
-            full_sync()
-            initial_ok = True
-            break
-        except MemoryError:
-            logger.critical("MemoryError no full sync inicial (tentativa %d/3)!", attempt + 1)
-            force_free_memory()
-            _reset_all_sessions("MemoryError")
-            time.sleep(30)
-        except Exception:
-            logger.exception("Erro no full sync inicial (tentativa %d/3).", attempt + 1)
-            if attempt < 2:
-                _reset_all_sessions("erro inicial")
-            time.sleep(30)
+    try:
+        _acquire_single_instance_lock()
+        atexit.register(_release_single_instance_lock)
+    except RuntimeError as exc:
+        logger.error(str(exc))
+        return
 
-    if not initial_ok:
-        logger.error("Full sync inicial falhou 3x — entrando no loop mesmo assim.")
+    if not _acquire_distributed_lock():
+        _release_single_instance_lock()
+        return
+    atexit.register(_release_distributed_lock)
 
-    last_full = time.time()
+    logger.info(
+        "Agendamento de full diario: %02d:%02d (%s)",
+        _FULL_SYNC_DAILY_HOUR,
+        _FULL_SYNC_DAILY_MINUTE,
+        FULL_SYNC_TIMEZONE,
+    )
+
+    try:
+        _refresh_distributed_lock_if_needed(force=True)
+        _rehydrate_known_task_ids_from_sheet()
+    except Exception:
+        logger.exception("Falha ao reidratar _known_task_ids da planilha.")
+
+    if _shutdown_requested:
+        logger.info("Shutdown antes do full sync inicial.")
+        return
+    if not _run_full_sync_until_success(
+        reason="inicial",
+    ):
+        logger.info("Shutdown durante retries do full inicial.")
+        return
+
+    next_full_ts = _next_full_sync_timestamp()
+    logger.info("Proximo full diario agendado para %s.", _format_local_dt(next_full_ts))
+
     last_delta_ts = int(time.time() * 1000)
     consecutive_errors = 0
     cycle_count = 0
@@ -1102,86 +1732,103 @@ def main() -> None:
 
     while not _shutdown_requested:
         try:
-            # ── Sleep primeiro (não roda delta logo após full) ──
             _interruptible_sleep(DELTA_SYNC_INTERVAL_S)
             if _shutdown_requested:
                 break
 
             now = time.time()
             cycle_count += 1
+            _refresh_distributed_lock_if_needed()
 
-            # ── Heartbeat a cada 10 ciclos ───────────────
             if cycle_count % 10 == 0:
                 uptime_h = (now - boot_time) / 3600
                 logger.info(
-                    "♥ Heartbeat — ciclo %d, uptime %.1fh, RSS %.1f MB, "
-                    "erros consecutivos: %d",
-                    cycle_count, uptime_h, stats.get_memory_mb_safe(),
+                    "Heartbeat - ciclo %d, uptime %.1fh, RSS %.1f MB, erros consecutivos: %d",
+                    cycle_count,
+                    uptime_h,
+                    stats.get_memory_mb_safe(),
                     consecutive_errors,
                 )
 
-            # ── Sync ─────────────────────────────────────
-            if now - last_full >= FULL_SYNC_INTERVAL_S:
-                full_sync()
-                last_full = time.time()
-                last_delta_ts = int(time.time() * 1000)
-            else:
-                last_delta_ts = delta_sync(last_delta_ts)
+            if now >= next_full_ts:
+                logger.info("Janela de full diario atingida (%s).", _format_local_dt(now))
+                ok = _run_full_sync_until_success(
+                    reason="diario",
+                )
+                if not ok:
+                    break
 
-            # Sucesso: reset contador de erros
+                next_full_ts = _next_full_sync_timestamp()
+                logger.info("Proximo full diario agendado para %s.", _format_local_dt(next_full_ts))
+                last_delta_ts = int(time.time() * 1000)
+                consecutive_errors = 0
+                continue
+
+            last_delta_ts = delta_sync(last_delta_ts)
             consecutive_errors = 0
 
         except KeyboardInterrupt:
-            logger.info("Ctrl+C — encerrando.")
+            logger.info("Ctrl+C - encerrando.")
             break
 
         except MemoryError:
             consecutive_errors += 1
+            end_memory_cycle("DELTA SYNC")
             logger.critical(
-                "MemoryError no ciclo %d (erro consecutivo #%d)! "
-                "Forçando gc + reset de caches.",
-                cycle_count, consecutive_errors,
+                "MemoryError no ciclo %d (erro consecutivo #%d).",
+                cycle_count,
+                consecutive_errors,
             )
             force_free_memory()
-            _reset_all_sessions("MemoryError")
+            _reset_all_sessions("MemoryError_loop")
             _interruptible_sleep(60)
 
         except Exception:
             consecutive_errors += 1
+            end_memory_cycle("DELTA SYNC")
             backoff = min(
                 _ERROR_BACKOFF_BASE * (2 ** (consecutive_errors - 1)),
                 _ERROR_BACKOFF_MAX,
             )
             logger.exception(
                 "Erro no ciclo %d (erro consecutivo #%d), retry em %ds...",
-                cycle_count, consecutive_errors, backoff,
+                cycle_count,
+                consecutive_errors,
+                backoff,
             )
-
-            # Escalation: após N erros seguidos, reset total
             if consecutive_errors >= _MAX_CONSECUTIVE_ERRORS:
                 logger.warning(
-                    "Atingiu %d erros consecutivos — reset total de sessions.",
+                    "Atingiu %d erros consecutivos - reset total de sessions.",
                     consecutive_errors,
                 )
                 _reset_all_sessions("escalation por erros consecutivos")
-                consecutive_errors = 0  # Reset para não logar infinitamente
+                consecutive_errors = 0
 
             _interruptible_sleep(backoff)
 
-    # ── Shutdown graceful ────────────────────────────────
     logger.info(
-        "Shutdown graceful — %d ciclos executados, uptime %.1fh",
-        cycle_count, (time.time() - boot_time) / 3600,
+        "Shutdown graceful - %d ciclos executados, uptime %.1fh",
+        cycle_count,
+        (time.time() - boot_time) / 3600,
     )
+    _release_single_instance_lock()
+    _release_distributed_lock()
     log_memory("Shutdown")
-
 
 def _interruptible_sleep(seconds: float) -> None:
     """Sleep que pode ser interrompido por SIGTERM."""
     end = time.time() + seconds
+    next_lock_refresh = time.time() + max(10, DISTRIBUTED_LOCK_REFRESH_S)
     while time.time() < end and not _shutdown_requested:
+        if DISTRIBUTED_LOCK_ENABLED and time.time() >= next_lock_refresh:
+            _refresh_distributed_lock_if_needed(force=True)
+            next_lock_refresh = time.time() + max(10, DISTRIBUTED_LOCK_REFRESH_S)
         time.sleep(min(1.0, end - time.time()))
 
 
 if __name__ == "__main__":
     main()
+
+
+
+
