@@ -60,6 +60,13 @@ _lifetime_clickup = 0
 _lifetime_sheets = 0
 _lifetime_powerrev = 0
 
+# Estado de monitoramento de memória por ciclo (FULL/DELTA)
+_mem_cycle_name: str | None = None
+_mem_cycle_start_mb: float = -1.0
+_mem_cycle_peak_mb: float = -1.0
+_mem_cycle_min_mb: float = -1.0
+_mem_cycle_samples: int = 0
+
 
 def get_memory_mb() -> float:
     """Lê RSS do processo. Suporta Linux e Windows."""
@@ -87,9 +94,87 @@ def get_memory_mb() -> float:
 
 def log_memory(label: str = "") -> None:
     """Loga uso de memória atual."""
+    global _mem_cycle_peak_mb, _mem_cycle_min_mb, _mem_cycle_samples
     mb = get_memory_mb()
+
+    if _mem_cycle_name is not None and mb >= 0:
+        if _mem_cycle_samples <= 0:
+            _mem_cycle_peak_mb = mb
+            _mem_cycle_min_mb = mb
+            _mem_cycle_samples = 1
+        else:
+            if mb > _mem_cycle_peak_mb:
+                _mem_cycle_peak_mb = mb
+            if mb < _mem_cycle_min_mb:
+                _mem_cycle_min_mb = mb
+            _mem_cycle_samples += 1
+
     prefix = f"[{label}] " if label else ""
-    logger.info("%sMemória RSS: %.1f MB", prefix, mb)
+    if _mem_cycle_name is not None and _mem_cycle_peak_mb >= 0:
+        logger.info(
+            "%sMemória RSS: %.1f MB (ciclo=%s, pico=%.1f MB, min=%.1f MB)",
+            prefix,
+            mb,
+            _mem_cycle_name,
+            _mem_cycle_peak_mb,
+            _mem_cycle_min_mb,
+        )
+    else:
+        logger.info("%sMemória RSS: %.1f MB", prefix, mb)
+
+
+def begin_memory_cycle(cycle_name: str) -> None:
+    """Inicia monitoramento de memória de um ciclo."""
+    global _mem_cycle_name, _mem_cycle_start_mb, _mem_cycle_peak_mb, _mem_cycle_min_mb, _mem_cycle_samples
+    mb = get_memory_mb()
+    _mem_cycle_name = cycle_name
+    _mem_cycle_start_mb = mb
+    _mem_cycle_peak_mb = mb
+    _mem_cycle_min_mb = mb
+    _mem_cycle_samples = 1 if mb >= 0 else 0
+    logger.info("[MEM-CYCLE %s] início RSS: %.1f MB", cycle_name, mb)
+
+
+def end_memory_cycle(cycle_name: str) -> None:
+    """Finaliza monitoramento de memória de um ciclo e loga resumo."""
+    global _mem_cycle_name, _mem_cycle_start_mb, _mem_cycle_peak_mb, _mem_cycle_min_mb, _mem_cycle_samples
+    if _mem_cycle_name is None and _mem_cycle_samples <= 0 and _mem_cycle_start_mb < 0:
+        return
+
+    end_mb = get_memory_mb()
+    active_name = _mem_cycle_name or cycle_name
+
+    if end_mb >= 0:
+        if _mem_cycle_samples <= 0:
+            _mem_cycle_peak_mb = end_mb
+            _mem_cycle_min_mb = end_mb
+            _mem_cycle_samples = 1
+        else:
+            if end_mb > _mem_cycle_peak_mb:
+                _mem_cycle_peak_mb = end_mb
+            if end_mb < _mem_cycle_min_mb:
+                _mem_cycle_min_mb = end_mb
+
+    delta_end = (end_mb - _mem_cycle_start_mb) if (_mem_cycle_start_mb >= 0 and end_mb >= 0) else 0.0
+    amplitude = (_mem_cycle_peak_mb - _mem_cycle_min_mb) if (_mem_cycle_peak_mb >= 0 and _mem_cycle_min_mb >= 0) else 0.0
+
+    logger.info(
+        "[MEM-CYCLE %s] resumo: início=%.1f MB | pico=%.1f MB | mínimo=%.1f MB | fim=%.1f MB | delta_fim_inicio=%+.1f MB | amplitude=%.1f MB | amostras=%d",
+        active_name,
+        _mem_cycle_start_mb,
+        _mem_cycle_peak_mb,
+        _mem_cycle_min_mb,
+        end_mb,
+        delta_end,
+        amplitude,
+        _mem_cycle_samples,
+    )
+
+    _mem_cycle_name = None
+    _mem_cycle_start_mb = -1.0
+    _mem_cycle_peak_mb = -1.0
+    _mem_cycle_min_mb = -1.0
+    _mem_cycle_samples = 0
 
 
 def force_free_memory() -> None:
@@ -117,7 +202,7 @@ def log_sync_stats(sync_type: str) -> None:
     _lifetime_powerrev += stats.powerrev_requests
 
     logger.info(
-        "─── STATS %s ───\n"
+        "[STATS %s]\n"
         "  ClickUp:  %d requests, %d tasks fetched\n"
         "  Sheets:   %d reads, %d writes, %d cells written\n"
         "  PowerRev: %d requests, %d invoices fetched\n"

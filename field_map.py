@@ -87,12 +87,28 @@ FIELD_MAP = {
         "header": "Valor do boleto",
         "source": "placeholder",
     },
+    "valor_final": {
+        "header": "Valor final",
+        "source": "placeholder",
+    },
+    "data_emissao_final": {
+        "header": "Data de emissão final",
+        "source": "placeholder",
+    },
     "validacao": {
         "header": "Validação",
         "source": "placeholder",
     },
     "observacoes": {
         "header": "Observações",
+        "source": "placeholder",
+    },
+    "parentesco_agrupado": {
+        "header": "Parentesco agrupado",
+        "source": "placeholder",
+    },
+    "invoice_id": {
+        "header": "Invoice ID",
         "source": "placeholder",
     },
 }
@@ -120,7 +136,7 @@ COMPUTATION_FIELDS = {
     },
 }
 
-# ── Campos de observações (3 CFs concatenados na coluna L) ─
+# ── Campos de observações (3 CFs concatenados em "Observações ClickUp") ─
 OBS_FIELDS = [
     {"label": "Plano", "cf_id": "48b2d7f1-d2e0-45b4-a58a-3f83686ea980"},
     {"label": "Gerais", "cf_id": "94ef8acf-865b-4bcc-b763-02ce2aa184a7"},
@@ -195,13 +211,17 @@ COLUMN_ORDER = [
     "plano",
     "distribuidora",
     "tipo_faturamento",
-    "observacoes_clickup",
+    "observacoes",          # coluna manual protegida
+    "valor_boleto",         # valor PowerRev
+    "valor_final",          # coluna manual protegida
+    "data_emissao_fatura",  # data emissao em O
+    "data_emissao_final",   # coluna manual protegida
     "status_faturamento",
     "provider_name",
-    "data_emissao_fatura",
-    "valor_boleto",
+    "observacoes_clickup",
     "validacao",
-    "observacoes",
+    "parentesco_agrupado",  # coluna S
+    "invoice_id",           # coluna tecnica (oculta)
 ]
 
 

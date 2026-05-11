@@ -302,6 +302,10 @@ def build_row(
             row.append(invoice.get("issueDate", ""))
         elif key == "valor_boleto":
             row.append(invoice.get("total", ""))
+        elif key == "parentesco_agrupado":
+            row.append(invoice.get("parentGroupedUc", ""))
+        elif key == "invoice_id":
+            row.append(invoice.get("invoiceId", ""))
         else:
             row.append(base_values.get(key, ""))
 
