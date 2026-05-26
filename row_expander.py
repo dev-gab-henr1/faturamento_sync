@@ -4,9 +4,11 @@ PowerRev define quais linhas existem (uma por invoice).
 ClickUp enriquece com dados do cooperado.
 """
 from datetime import datetime
+import re
+import unicodedata
 from field_map import (
     FIELD_MAP, DATE_FIELDS, COLUMN_ORDER,
-    COMPUTATION_FIELDS, DROPDOWN_OPTIONS, RAZAO_SOCIAL_VENCTO_EXTRA,
+    COMPUTATION_FIELDS, DROPDOWN_OPTIONS,
     OBS_FIELDS,
 )
 from transformers import TRANSFORMERS, clean_description
@@ -43,6 +45,7 @@ for _spec in FIELD_MAP.values():
         if _spec["cf_id"] not in DROPDOWN_OPTIONS:
             _NEEDS_TYPE_CONFIG.add(_spec["cf_id"])
 _DROPDOWN_CF_IDS.add(COMPUTATION_FIELDS["mes_envio_boleto"]["cf_id"])
+_DROPDOWN_CF_IDS.add(COMPUTATION_FIELDS["mes_vencimento_boleto"]["cf_id"])
 
 
 def slim_task(task: dict) -> dict:
@@ -62,6 +65,7 @@ def slim_task(task: dict) -> dict:
             slim_cfs.append(slim_cf)
     return {
         "id": task.get("id", ""),
+        "list_id": str(task.get("list", {}).get("id", "") or ""),
         "custom_fields": slim_cfs,
     }
 
@@ -115,6 +119,83 @@ def _resolve_dropdown_value(cf_id: str, raw_value: str) -> str:
     return opts.get(raw_value, raw_value)
 
 
+def _normalize_dropdown_label(text: str) -> str:
+    raw = str(text or "").strip().lower()
+    if not raw:
+        return ""
+    raw = raw.replace("mÃªs", "mês").replace("mãªs", "mês")
+    normalized = unicodedata.normalize("NFKD", raw)
+    normalized = "".join(ch for ch in normalized if not unicodedata.combining(ch))
+    normalized = normalized.replace("_", " ").replace("-", " ")
+    return " ".join(normalized.split())
+
+
+def _parse_month_offset(label: str) -> int | None:
+    normalized = _normalize_dropdown_label(label)
+    if not normalized:
+        return None
+
+    # Regras tolerantes a variações de encoding/acento.
+    if "mesmo" in normalized and "emiss" in normalized:
+        return 0
+    if "dois mes" in normalized and "emiss" in normalized:
+        return 2
+    if "um mes" in normalized and "emiss" in normalized:
+        return 1
+
+    # Novos labels
+    if "mesmo mes da emissao" in normalized:
+        return 0
+    if "um mes apos a emissao" in normalized:
+        return 1
+    if "dois meses apos a emissao" in normalized:
+        return 2
+
+    # Retrocompatibilidade
+    if "mes atual" in normalized:
+        return 0
+    if "mes seguinte" in normalized or "seguinte" in normalized:
+        return 1
+
+    # Fallback numerico
+    if normalized.isdigit():
+        off = int(normalized)
+        if 0 <= off <= 2:
+            return off
+
+    m = re.search(r"\b([0-2])\b", normalized)
+    if m:
+        return int(m.group(1))
+
+    return None
+
+
+def _get_month_offset_by_cf(task: dict, cf_id: str, default: int = 0) -> int:
+    cf = _get_cf_value(task, cf_id)
+    if cf is None:
+        return default
+
+    resolved = TRANSFORMERS["resolve_dropdown"](cf)
+    parsed = _parse_month_offset(resolved)
+    if parsed is not None:
+        return parsed
+
+    raw_value = cf.get("value")
+    if raw_value is not None:
+        parsed = _parse_month_offset(str(raw_value))
+        if parsed is not None:
+            return parsed
+
+        try:
+            off = int(float(raw_value))
+            if 0 <= off <= 2:
+                return off
+        except (ValueError, TypeError):
+            pass
+
+    return default
+
+
 def _extract_field_value(task: dict, key: str) -> str:
     spec = FIELD_MAP[key]
     source = spec["source"]
@@ -145,11 +226,11 @@ def _extract_field_value(task: dict, key: str) -> str:
 
 
 def _compute_envio_boleto(
-    dia_envio: int, ref_month: int, ref_year: int, mes_seguinte: bool,
+    dia_envio: int, ref_month: int, ref_year: int, month_offset: int,
 ) -> str:
     month, year = ref_month, ref_year
-    if mes_seguinte:
-        month, year = _add_months(month, year, 1)
+    if month_offset:
+        month, year = _add_months(month, year, month_offset)
     return f"{dia_envio:02d}/{month:02d}/{year}"
 
 
@@ -158,13 +239,12 @@ def _compute_data_vencimento(
     dia_envio: int,
     ref_month: int,
     ref_year: int,
-    mes_seguinte: bool,
-    razao_social: str,
+    month_offset: int,
 ) -> str:
     month, year = ref_month, ref_year
-    if mes_seguinte:
-        month, year = _add_months(month, year, 1)
-    extra = (dia_vencto < dia_envio) or (razao_social.strip() in RAZAO_SOCIAL_VENCTO_EXTRA)
+    if month_offset:
+        month, year = _add_months(month, year, month_offset)
+    extra = dia_vencto < dia_envio
     if extra:
         month, year = _add_months(month, year, 1)
     return f"{dia_vencto:02d}/{month:02d}/{year}"
@@ -182,6 +262,98 @@ def get_fim_operacao(task: dict) -> datetime | None:
     if cf is None:
         return None
     return _parse_date(cf.get("value"))
+
+
+def get_fim_operacao_display(task: dict | None) -> str:
+    """Retorna texto para coluna de fim de operação."""
+    if not task:
+        return "Sem data de fim definida."
+    dt = get_fim_operacao(task)
+    if dt is None:
+        return "Sem data de fim definida."
+    return dt.strftime("%d/%m/%Y")
+
+
+def compute_data_vencimento_for_task(task: dict | None, mes_label: str) -> str:
+    """Calcula Data de Vencimento (coluna G) para um mês de referência da linha."""
+    if not task or not mes_label:
+        return ""
+
+    ref_ym = label_to_yyyymm(str(mes_label).strip())
+    if len(ref_ym) < 6:
+        return ""
+
+    ref_month = int(ref_ym[4:6])
+    ref_year = int(ref_ym[:4])
+
+    dia_envio_raw = _get_cf_raw(task, COMPUTATION_FIELDS["dia_envio_boleto"]["cf_id"])
+    dia_vencto_raw = _get_cf_raw(task, COMPUTATION_FIELDS["dia_vencto_boleto"]["cf_id"])
+
+    try:
+        dia_envio = int(float(dia_envio_raw)) if dia_envio_raw else 0
+    except (ValueError, TypeError):
+        dia_envio = 0
+    try:
+        dia_vencto = int(float(dia_vencto_raw)) if dia_vencto_raw else 0
+    except (ValueError, TypeError):
+        dia_vencto = 0
+
+    if not dia_vencto:
+        return ""
+
+    month_offset_envio = _get_month_offset_by_cf(
+        task,
+        COMPUTATION_FIELDS["mes_envio_boleto"]["cf_id"],
+        default=0,
+    )
+    month_offset_venc = _get_month_offset_by_cf(
+        task,
+        COMPUTATION_FIELDS["mes_vencimento_boleto"]["cf_id"],
+        default=month_offset_envio,
+    )
+
+    return _compute_data_vencimento(
+        dia_vencto=dia_vencto,
+        dia_envio=dia_envio,
+        ref_month=ref_month,
+        ref_year=ref_year,
+        month_offset=month_offset_venc,
+    )
+
+
+def compute_envio_boleto_for_task(task: dict | None, mes_label: str) -> str:
+    """Calcula Envio do boleto (coluna F) para um mes de referencia da linha."""
+    if not task or not mes_label:
+        return ""
+
+    ref_ym = label_to_yyyymm(str(mes_label).strip())
+    if len(ref_ym) < 6:
+        return ""
+
+    ref_month = int(ref_ym[4:6])
+    ref_year = int(ref_ym[:4])
+
+    dia_envio_raw = _get_cf_raw(task, COMPUTATION_FIELDS["dia_envio_boleto"]["cf_id"])
+    try:
+        dia_envio = int(float(dia_envio_raw)) if dia_envio_raw else 0
+    except (ValueError, TypeError):
+        dia_envio = 0
+
+    if not dia_envio:
+        return ""
+
+    month_offset_envio = _get_month_offset_by_cf(
+        task,
+        COMPUTATION_FIELDS["mes_envio_boleto"]["cf_id"],
+        default=0,
+    )
+
+    return _compute_envio_boleto(
+        dia_envio=dia_envio,
+        ref_month=ref_month,
+        ref_year=ref_year,
+        month_offset=month_offset_envio,
+    )
 
 
 def extract_task_uc(task: dict) -> str:
@@ -247,7 +419,6 @@ def build_row(
 
         dia_envio_raw = _get_cf_raw(task, COMPUTATION_FIELDS["dia_envio_boleto"]["cf_id"])
         dia_vencto_raw = _get_cf_raw(task, COMPUTATION_FIELDS["dia_vencto_boleto"]["cf_id"])
-        mes_envio_raw = _get_cf_raw(task, COMPUTATION_FIELDS["mes_envio_boleto"]["cf_id"])
 
         try:
             dia_envio = int(float(dia_envio_raw)) if dia_envio_raw else 0
@@ -258,19 +429,22 @@ def build_row(
         except (ValueError, TypeError):
             dia_vencto = 0
 
-        mes_envio_label = ""
-        if mes_envio_raw:
-            cf_mes_envio = _get_cf_value(task, COMPUTATION_FIELDS["mes_envio_boleto"]["cf_id"])
-            if cf_mes_envio:
-                mes_envio_label = TRANSFORMERS["resolve_dropdown"](cf_mes_envio)
-        mes_seguinte = mes_envio_label == "Mês Seguinte"
-        razao_social = base_values.get("razao_social", "")
+        month_offset_envio = _get_month_offset_by_cf(
+            task,
+            COMPUTATION_FIELDS["mes_envio_boleto"]["cf_id"],
+            default=0,
+        )
+        month_offset_venc = _get_month_offset_by_cf(
+            task,
+            COMPUTATION_FIELDS["mes_vencimento_boleto"]["cf_id"],
+            default=month_offset_envio,
+        )
     else:
         base_values = {k: "" for k in COLUMN_ORDER}
         dia_envio = 0
         dia_vencto = 0
-        mes_seguinte = False
-        razao_social = ""
+        month_offset_envio = 0
+        month_offset_venc = 0
 
     # Montar linha
     row: list[str] = []
@@ -280,7 +454,7 @@ def build_row(
         elif key == "envio_boleto":
             if dia_envio and ref_month:
                 row.append(_compute_envio_boleto(
-                    dia_envio, ref_month, ref_year, mes_seguinte,
+                    dia_envio, ref_month, ref_year, month_offset_envio,
                 ))
             else:
                 row.append("")
@@ -288,7 +462,7 @@ def build_row(
             if dia_vencto and ref_month:
                 row.append(_compute_data_vencimento(
                     dia_vencto, dia_envio, ref_month, ref_year,
-                    mes_seguinte, razao_social,
+                    month_offset_venc,
                 ))
             else:
                 row.append("")
@@ -303,7 +477,7 @@ def build_row(
         elif key == "valor_boleto":
             row.append(invoice.get("total", ""))
         elif key == "parentesco_agrupado":
-            row.append(invoice.get("parentGroupedUc", ""))
+            row.append(get_fim_operacao_display(task))
         elif key == "invoice_id":
             row.append(invoice.get("invoiceId", ""))
         else:

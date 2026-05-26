@@ -18,6 +18,13 @@ _SESSION: requests.Session | None = None
 _CF_OPTIONS_CACHE: dict[str, list[dict]] = {}
 
 
+def _is_last_page(payload: dict, tasks_len: int, page_limit: int) -> bool:
+    marker = payload.get("last_page")
+    if isinstance(marker, bool):
+        return marker
+    return tasks_len < page_limit
+
+
 def _get_session() -> requests.Session:
     global _SESSION
     if _SESSION is None:
@@ -138,7 +145,7 @@ def fetch_tasks(
         all_tasks.extend(tasks)
         stats.clickup_tasks_fetched += len(tasks)
 
-        if len(tasks) < page_limit:
+        if _is_last_page(data, len(tasks), page_limit):
             break
         page += 1
         time.sleep(0.3)
@@ -191,6 +198,7 @@ def fetch_team_tasks_with_uc(
     while True:
         params: dict = {
             "page": page,
+            "limit": 100,
             "include_closed": "true",
             "subtasks": "true",
             "custom_fields": cf_filter,
@@ -240,7 +248,7 @@ def fetch_team_tasks_with_uc(
         all_tasks.extend(tasks)
         stats.clickup_tasks_fetched += len(tasks)
 
-        if len(tasks) < 100:
+        if _is_last_page(data, len(tasks), 100):
             break
         page += 1
         time.sleep(0.3)
@@ -272,6 +280,7 @@ def iter_team_tasks_with_uc(
     while True:
         params: dict = {
             "page": page,
+            "limit": 100,
             "include_closed": "true",
             "subtasks": "true",
             "custom_fields": cf_filter,
@@ -323,7 +332,7 @@ def iter_team_tasks_with_uc(
 
         stats.clickup_tasks_fetched += len(tasks)
 
-        if len(tasks) < 100:
+        if _is_last_page(data, len(tasks), 100):
             break
         page += 1
         time.sleep(0.3)
