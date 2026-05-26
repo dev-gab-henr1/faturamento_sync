@@ -239,31 +239,18 @@ def _safe_token(value: str) -> str:
     return str(value or "").strip().replace("|", "/")
 
 
-def _kind_from_parent(parent_grouped_uc: str) -> str:
-    text = str(parent_grouped_uc or "").strip()
-    txt_upper = text.upper()
-    # Aceita variações de encoding/acento para "UC Mãe:"
-    if txt_upper.startswith("UC M") and ":" in txt_upper:
-        return "M"
-    if text:
-        return "C"
-    return "S"
-
-
 def _synthetic_invoice_id_from_row(
     *,
     uc: str,
-    parent_grouped_uc: str,
     issue_date: str,
     provider_name: str,
 ) -> str:
-    if not any([parent_grouped_uc, issue_date, provider_name]):
+    if not any([issue_date, provider_name]):
         return ""
     parts = [
         "SYN",
-        _kind_from_parent(parent_grouped_uc),
+        "R",
         _safe_token(uc),
-        _safe_token(parent_grouped_uc),
         _safe_token(issue_date),
         _safe_token(provider_name),
     ]
@@ -282,9 +269,10 @@ def _derive_invoice_id_from_row(
     explicit = _row_value(row, invoice_id_col)
     if explicit:
         return explicit
+    # parent_col mantido na assinatura para compatibilidade de chamadas legadas.
+    _ = parent_col
     return _synthetic_invoice_id_from_row(
         uc=_row_value(row, uc_col),
-        parent_grouped_uc=_row_value(row, parent_col),
         issue_date=_row_value(row, issue_col),
         provider_name=_row_value(row, provider_col),
     )
@@ -326,7 +314,6 @@ def _secondary_key(
     *,
     uc: str,
     mes: str,
-    parent_grouped_uc: str,
     issue_date: str,
     provider_name: str,
     status: str,
@@ -338,8 +325,6 @@ def _secondary_key(
         "SK",
         _safe_token(uc),
         _safe_token(mes),
-        _kind_from_parent(parent_grouped_uc),
-        _safe_token(parent_grouped_uc),
         _safe_token(issue_date),
         _safe_token(provider_name),
         _safe_token(status),
@@ -353,7 +338,6 @@ def _secondary_key_from_row(
     *,
     uc_col: int,
     mes_col: int,
-    parent_col: int | None,
     issue_col: int | None,
     provider_col: int | None,
     status_col: int | None,
@@ -362,7 +346,6 @@ def _secondary_key_from_row(
     return _secondary_key(
         uc=_row_value(row, uc_col),
         mes=_row_value(row, mes_col),
-        parent_grouped_uc=_row_value(row, parent_col),
         issue_date=_row_value(row, issue_col),
         provider_name=_row_value(row, provider_col),
         status=_row_value(row, status_col),
@@ -391,7 +374,7 @@ def _build_protected_snapshot_from_rows(data_rows: list[list[str]]) -> dict[str,
     invoice_id_col = COLUMN_ORDER.index("invoice_id") if "invoice_id" in COLUMN_ORDER else None
     provider_col = COLUMN_ORDER.index("provider_name") if "provider_name" in COLUMN_ORDER else None
     issue_col = COLUMN_ORDER.index("data_emissao_fatura") if "data_emissao_fatura" in COLUMN_ORDER else None
-    parent_col = COLUMN_ORDER.index("parentesco_agrupado") if "parentesco_agrupado" in COLUMN_ORDER else None
+    parent_col = None
     status_col = COLUMN_ORDER.index("status_faturamento") if "status_faturamento" in COLUMN_ORDER else None
     total_col = COLUMN_ORDER.index("valor_boleto") if "valor_boleto" in COLUMN_ORDER else None
     saved_primary: dict[str, list[str]] = {}
@@ -422,7 +405,6 @@ def _build_protected_snapshot_from_rows(data_rows: list[list[str]]) -> dict[str,
                 row,
                 uc_col=uc_col,
                 mes_col=mes_col,
-                parent_col=parent_col,
                 issue_col=issue_col,
                 provider_col=provider_col,
                 status_col=status_col,
@@ -581,7 +563,7 @@ def write_all_rows(
     invoice_id_col = COLUMN_ORDER.index("invoice_id") if "invoice_id" in COLUMN_ORDER else None
     provider_col = COLUMN_ORDER.index("provider_name") if "provider_name" in COLUMN_ORDER else None
     issue_col = COLUMN_ORDER.index("data_emissao_fatura") if "data_emissao_fatura" in COLUMN_ORDER else None
-    parent_col = COLUMN_ORDER.index("parentesco_agrupado") if "parentesco_agrupado" in COLUMN_ORDER else None
+    parent_col = None
     status_col = COLUMN_ORDER.index("status_faturamento") if "status_faturamento" in COLUMN_ORDER else None
     total_col = COLUMN_ORDER.index("valor_boleto") if "valor_boleto" in COLUMN_ORDER else None
 
@@ -650,7 +632,6 @@ def write_all_rows(
                     row,
                     uc_col=uc_col,
                     mes_col=mes_col,
-                    parent_col=parent_col,
                     issue_col=issue_col,
                     provider_col=provider_col,
                     status_col=status_col,

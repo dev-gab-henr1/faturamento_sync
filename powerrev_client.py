@@ -55,6 +55,7 @@ _STATUS_TRANSLATION = {
     "NEGOTIATED": "Negociada",
     "READY_TO_REISSUE": "Reemissão Calculada",
 }
+_STATUS_MISSING_DISTRIBUTOR_INVOICE = "MISSING_DISTRIBUTOR_INVOICE"
 
 
 def _safe_str(value: Any) -> str:
@@ -72,7 +73,7 @@ def _synthetic_invoice_id(
     *,
     kind: str,
     uc: str,
-    parent_grouped_uc: str,
+    discriminator: str,
     issue_date: str,
     provider_name: str,
 ) -> str:
@@ -84,7 +85,7 @@ def _synthetic_invoice_id(
         "SYN",
         kind,
         _safe_token(uc),
-        _safe_token(parent_grouped_uc),
+        _safe_token(discriminator),
         _safe_token(issue_date),
         _safe_token(provider_name),
     ]
@@ -96,7 +97,7 @@ def _row_key(
     kind: str,
     uc: str,
     reference_month: str,
-    parent_grouped_uc: str,
+    discriminator: str,
     status: str,
     issue_date: str,
     total: float | str,
@@ -111,7 +112,7 @@ def _row_key(
         _safe_token(kind),
         _safe_token(uc),
         _safe_token(reference_month),
-        _safe_token(parent_grouped_uc),
+        _safe_token(discriminator),
         _safe_token(status),
         _safe_token(issue_date),
         _safe_token(total),
@@ -402,11 +403,98 @@ def _invoice_completeness_score(invoice: dict) -> int:
         "issueDate",
         "total",
         "providerName",
-        "parentGroupedUc",
     ):
         if _safe_str(invoice.get(key)):
             score += 1
     return score
+
+
+def _is_missing_distributor_invoice(invoice: dict) -> bool:
+    raw_status = _safe_str(invoice.get("statusRaw"))
+    if raw_status:
+        return raw_status == _STATUS_MISSING_DISTRIBUTOR_INVOICE
+    status = _safe_str(invoice.get("status"))
+    return status in (
+        _STATUS_MISSING_DISTRIBUTOR_INVOICE,
+        _STATUS_TRANSLATION.get(_STATUS_MISSING_DISTRIBUTOR_INVOICE, ""),
+    )
+
+
+def _pick_preferred_missing_distributor_invoice(candidates: list[dict]) -> dict:
+    """Escolhe deterministicamente 1 linha quando há múltiplos MDI para UC/mês."""
+    def _rank(inv: dict) -> tuple:
+        invoice_id = _safe_str(inv.get("invoiceId"))
+        has_real_id = bool(invoice_id and not invoice_id.startswith("SYN|"))
+        completeness = _invoice_completeness_score(inv)
+        has_issue = bool(_safe_str(inv.get("issueDate")))
+        has_total = bool(_safe_str(inv.get("total")))
+        stable = (
+            invoice_id,
+            _safe_str(inv.get("rowKey")),
+            _safe_str(inv.get("providerName")),
+        )
+        return (
+            1 if has_real_id else 0,
+            completeness,
+            1 if has_issue else 0,
+            1 if has_total else 0,
+            stable,
+        )
+
+    return max(candidates, key=_rank)
+
+
+def _apply_missing_distributor_rules(invoices: list[dict]) -> list[dict]:
+    """
+    Regras de negócio para MISSING_DISTRIBUTOR_INVOICE por UC+mês:
+      1) no máximo 1 MDI por UC+mês;
+      2) se existir qualquer status != MDI no mesmo UC+mês, remove todos os MDI.
+    """
+    grouped: dict[tuple[str, str], list[dict]] = {}
+    passthrough: list[dict] = []
+
+    for inv in invoices:
+        uc = _safe_str(inv.get("uc"))
+        ref = _safe_str(inv.get("referenceMonth"))
+        if not uc or not ref:
+            passthrough.append(inv)
+            continue
+        grouped.setdefault((uc, ref), []).append(inv)
+
+    filtered: list[dict] = list(passthrough)
+    removed_total = 0
+    collapsed_groups = 0
+    replaced_by_non_missing_groups = 0
+
+    for _, group in grouped.items():
+        missing = [inv for inv in group if _is_missing_distributor_invoice(inv)]
+        non_missing = [inv for inv in group if not _is_missing_distributor_invoice(inv)]
+
+        if non_missing:
+            filtered.extend(non_missing)
+            if missing:
+                removed_total += len(missing)
+                replaced_by_non_missing_groups += 1
+            continue
+
+        if len(missing) <= 1:
+            filtered.extend(group)
+            continue
+
+        keep = _pick_preferred_missing_distributor_invoice(missing)
+        filtered.append(keep)
+        removed_total += len(missing) - 1
+        collapsed_groups += 1
+
+    if removed_total:
+        logger.info(
+            "Regra MDI: removidas %d linhas (grupos colapsados=%d, grupos substituídos por não-MDI=%d).",
+            removed_total,
+            collapsed_groups,
+            replaced_by_non_missing_groups,
+        )
+
+    return filtered
 
 
 def _fetch_simple_invoice_items(reference_month: str) -> list[dict]:
@@ -460,14 +548,13 @@ def _fetch_simple_invoice_items(reference_month: str) -> list[dict]:
     return items
 
 
-def _fetch_grouped_invoice_rows(reference_month: str) -> list[tuple[str, dict, str]]:
-    """Busca cobranças agrupadas e faz flatten mãe + filhas.
+def _fetch_grouped_invoice_rows(reference_month: str) -> list[tuple[dict, str]]:
+    """Busca cobranças agrupadas e retorna apenas faturas filhas.
 
-    Retorna lista [(kind, item)] onde kind é:
-      - "M" (mãe)
-      - "C" (filha / innerAccounts)
+    Retorna lista [(item_filha, mother_ref)].
+    mother_ref é usado apenas para reforçar dedupe/synthetic id quando necessário.
     """
-    rows: list[tuple[str, dict, str]] = []
+    rows: list[tuple[dict, str]] = []
     page = 1
     limit = min(POWERREV_PAGE_LIMIT, 100)  # endpoint grouped limita em 100
 
@@ -492,13 +579,13 @@ def _fetch_grouped_invoice_rows(reference_month: str) -> list[tuple[str, dict, s
             mother_uc = _extract_grouped_consumer_unit(mother)
             if not mother_uc:
                 mother_uc = _resolve_uc_installation(mother) or ""
+            mother_ref = _safe_str(mother.get("id")) or mother_uc
 
-            rows.append(("M", mother, ""))
             inner = mother.get("innerAccounts", [])
             if isinstance(inner, list):
                 for child in inner:
                     if isinstance(child, dict):
-                        rows.append(("C", child, mother_uc))
+                        rows.append((child, mother_ref))
 
         if len(content) < limit:
             break
@@ -522,7 +609,7 @@ def fetch_invoices_for_month(reference_month: str) -> list[dict]:
 
     # Dedupe por chave:
     # 1) id quando disponível (mais forte)
-    # 2) chave composta quando id = null (inclui kind para evitar colisão mãe/filha)
+    # 2) chave composta quando id = null
     deduped: dict[tuple, dict] = {}
 
     # Normalizar dados simples
@@ -530,13 +617,14 @@ def fetch_invoices_for_month(reference_month: str) -> list[dict]:
         uc = _resolve_uc_installation(item) or ""
         raw_status = _safe_str(item.get("status"))
         raw_id = _safe_str(item.get("id"))
+        discriminator = _safe_str(item.get("accountId")) or _safe_str(item.get("consumerUnits"))
         translated_status = _STATUS_TRANSLATION.get(raw_status, raw_status)
         formatted_issue = _format_date(item.get("issueDate"))
         formatted_total = _to_currency_number(item.get("total"))
         invoice_id = raw_id or _synthetic_invoice_id(
             kind="S",
             uc=uc,
-            parent_grouped_uc="",
+            discriminator=discriminator,
             issue_date=formatted_issue,
             provider_name=item.get("providerName", ""),
         )
@@ -554,7 +642,7 @@ def fetch_invoices_for_month(reference_month: str) -> list[dict]:
                 kind="S",
                 uc=uc,
                 reference_month=reference_month,
-                parent_grouped_uc="",
+                discriminator=discriminator,
                 status=translated_status,
                 issue_date=formatted_issue,
                 total=formatted_total,
@@ -580,8 +668,8 @@ def fetch_invoices_for_month(reference_month: str) -> list[dict]:
         if prev is None or _invoice_completeness_score(invoice) > _invoice_completeness_score(prev):
             deduped[key] = invoice
 
-    # Normalizar dados agrupados (mãe + filhas)
-    for kind, item, parent_uc in grouped_rows:
+    # Normalizar dados agrupados (somente filhas)
+    for item, mother_ref in grouped_rows:
         uc = _extract_grouped_consumer_unit(item)
         if not uc:
             # fallback robusto para compatibilidade com formatos heterogêneos
@@ -590,21 +678,21 @@ def fetch_invoices_for_month(reference_month: str) -> list[dict]:
         raw_status = _safe_str(item.get("status"))
         ref = _safe_str(item.get("referenceMonth")) or reference_month
         raw_id = _safe_str(item.get("id"))
-        parent_grouped_uc = f"UC Mãe: {uc}" if kind == "M" and uc else (parent_uc if kind == "C" else "")
+        discriminator = _safe_str(item.get("accountId")) or mother_ref
         translated_status = _STATUS_TRANSLATION.get(raw_status, raw_status)
         formatted_issue = _format_date(item.get("issueDate"))
         formatted_total = _to_currency_number(item.get("total"))
         invoice_id = raw_id or _synthetic_invoice_id(
-            kind=("M" if kind == "M" else "C"),
+            kind="G",
             uc=uc,
-            parent_grouped_uc=parent_grouped_uc,
+            discriminator=discriminator,
             issue_date=formatted_issue,
             provider_name=item.get("providerName", ""),
         )
         invoice = {
             "invoiceId": invoice_id,
             "uc": uc,
-            "parentGroupedUc": parent_grouped_uc,
+            "parentGroupedUc": "",
             "referenceMonth": ref,
             "providerName": item.get("providerName", ""),
             "statusRaw": raw_status,
@@ -612,10 +700,10 @@ def fetch_invoices_for_month(reference_month: str) -> list[dict]:
             "issueDate": formatted_issue,
             "total": formatted_total,
             "rowKey": _row_key(
-                kind=("M" if kind == "M" else "C"),
+                kind="G",
                 uc=uc,
                 reference_month=ref,
-                parent_grouped_uc=parent_grouped_uc,
+                discriminator=discriminator,
                 status=translated_status,
                 issue_date=formatted_issue,
                 total=formatted_total,
@@ -628,11 +716,10 @@ def fetch_invoices_for_month(reference_month: str) -> list[dict]:
         else:
             key = (
                 "GNULL",
-                kind,  # evita colidir mãe x filha quando ambos têm id null
                 ref,
                 _safe_str(item.get("accountId")),
                 uc,
-                parent_uc if kind == "C" else "",
+                mother_ref,
                 raw_status,
                 _safe_str(item.get("issueDate")),
                 _safe_str(item.get("dueDate")),
@@ -645,15 +732,19 @@ def fetch_invoices_for_month(reference_month: str) -> list[dict]:
             deduped[key] = invoice
 
     resolved = list(deduped.values())
+    pre_rule_count = len(resolved)
+    resolved = _apply_missing_distributor_rules(resolved)
+    removed_by_rule = pre_rule_count - len(resolved)
 
     stats.powerrev_invoices_fetched += len(resolved)
     if resolved:
         logger.info(
-            "  → %d invoices (simples=%d, agrupadas_flat=%d, dedup=%d)",
+            "  → %d invoices (simples=%d, agrupadas_flat=%d, dedup=%d, regra_mdi=%d)",
             len(resolved),
             len(simple_items),
             len(grouped_rows),
             len(simple_items) + len(grouped_rows) - len(resolved),
+            removed_by_rule,
         )
     else:
         logger.info("  → sem dados")

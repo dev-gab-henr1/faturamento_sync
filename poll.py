@@ -21,6 +21,7 @@ import atexit
 import socket
 import random
 import re
+import unicodedata
 from collections import defaultdict, deque
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
@@ -54,16 +55,16 @@ from row_expander import (
     slim_task,
     get_inicio_operacao,
     get_fim_operacao,
+    get_fim_operacao_display,
+    compute_data_vencimento_for_task,
+    compute_envio_boleto_for_task,
     extract_task_uc,
     build_row,
     yyyymm_to_label,
     label_to_yyyymm,
     _extract_field_value,
     _build_observacoes,
-    _get_cf_raw,
     _resolve_dropdown_value,
-    _compute_envio_boleto,
-    _compute_data_vencimento,
 )
 from sheets_manager import (
     get_worksheet,
@@ -75,7 +76,7 @@ from sheets_manager import (
     update_columns_in_place,
     reset_client as reset_sheets_client,
 )
-from field_map import get_headers, COLUMN_ORDER, FIELD_MAP, COMPUTATION_FIELDS, RAZAO_SOCIAL_VENCTO_EXTRA
+from field_map import get_headers, COLUMN_ORDER, FIELD_MAP
 from stats import (
     stats,
     log_memory,
@@ -111,6 +112,11 @@ _ERROR_BACKOFF_BASE = 30     # backoff base em segundos
 _ERROR_BACKOFF_MAX = 300     # backoff máximo (5 min)
 _ERRO_SISTEMA = "Erro no sistema"  # marca em Q para invoices que sumiram da PowerRev
 _NAO_PROCESSADO = "Não processado"  # marca em Q para fatura do mes seguinte ainda nao gerada
+_MISSING_DISTRIBUTOR_STATUS_ALIASES = {
+    "MISSING DISTRIBUTOR INVOICE",
+    "SEM FATURA DISTRIBUIDORA",
+    "SEM FATURA DA DISTRIBUIDORA",
+}
 
 _known_task_ids: set[str] = set()
 _FAR_FUTURE = datetime(9999, 1, 1)
@@ -118,6 +124,11 @@ _LOCK_FILE_PATH = os.path.join(os.path.dirname(__file__), ".faturamento_sync.loc
 _LOCK_HANDLE = None
 _DLOCK_OWNER_ID = f"{socket.gethostname()}:{os.getpid()}:{int(time.time())}:{random.randint(1000,9999)}"
 _DLOCK_LAST_REFRESH_TS = 0.0
+
+
+def _is_missing_distributor_status(status_value: str) -> bool:
+    normalized = " ".join(str(status_value or "").strip().upper().replace("_", " ").split())
+    return normalized in _MISSING_DISTRIBUTOR_STATUS_ALIASES
 
 
 def _resolve_full_sync_tz(tz_name: str):
@@ -154,6 +165,51 @@ def _extract_task_id_from_link(link: str) -> str:
     if link.startswith("https://app.clickup.com/t/"):
         return link.split("/t/")[-1]
     return link
+
+
+def _normalize_header_name(text: str) -> str:
+    raw = str(text or "").strip().lower()
+    if not raw:
+        return ""
+
+    # Tentativa de corrigir mojibake comum (UTF-8 lido como latin-1/cp1252).
+    try:
+        fixed = raw.encode("latin-1").decode("utf-8")
+        if fixed:
+            raw = fixed.lower()
+    except Exception:
+        pass
+
+    normalized = unicodedata.normalize("NFKD", raw)
+    normalized = "".join(ch for ch in normalized if not unicodedata.combining(ch))
+    normalized = normalized.replace("_", " ").replace("-", " ")
+    return " ".join(normalized.split())
+
+
+def _header_index(headers: list[str], *candidates: str) -> int:
+    # Match exato primeiro (mais rápido e preserva comportamento atual).
+    for c in candidates:
+        if c in headers:
+            return headers.index(c)
+
+    # Match normalizado (aceita acento/sem acento e mojibake).
+    norm_to_idx: dict[str, int] = {}
+    for i, h in enumerate(headers):
+        norm_to_idx.setdefault(_normalize_header_name(h), i)
+    for c in candidates:
+        idx = norm_to_idx.get(_normalize_header_name(c))
+        if idx is not None:
+            return idx
+
+    raise ValueError(f"Nenhum header encontrado para aliases: {candidates!r}")
+
+
+def _has_header(headers: list[str], *candidates: str) -> bool:
+    try:
+        _header_index(headers, *candidates)
+        return True
+    except Exception:
+        return False
 
 
 def _parse_daily_time(value: str) -> tuple[int, int]:
@@ -342,7 +398,7 @@ def _rehydrate_known_task_ids_from_sheet() -> int:
     ws = get_worksheet()
     ensure_headers(ws)
     headers = get_headers()
-    task_id_col = headers.index("Task ID")
+    task_id_col = _header_index(headers, "Task ID")
     task_id_values = read_column_values(ws, task_id_col)
 
     restored = 0
@@ -395,7 +451,18 @@ def _run_full_sync_until_success(
     return False
 
 _STATUS_TROCA_PLANO = "25a28dc4-16ff-4ecf-b94f-a7b3a6eef42c"
+_STATUS_PLANEJAMENTO_BLACK = "29e28b58-2922-49c9-a8d0-f2a83d398d0a"
 _STATUS_CF_ID = "1a5118f7-b9a0-466f-889d-37edd76bd304"
+_STATUS_TROCA_PLANO_LABEL = "Encerrado - Troca de Plano"
+_STATUS_PLANEJAMENTO_BLACK_LABEL = "Planejamento - Black"
+_PLANEJAMENTO_LIST_ID = "901321549851"
+_NEVER_JOINED_STATUS_LABELS = (
+    "Eliminado",
+    "Excluido",
+    "Demitido",
+    "Encerrado - Financeiro",
+    "Baixo Consumo",
+)
 
 
 def _get_task_status_raw(task: dict) -> str:
@@ -419,29 +486,40 @@ def _get_task_status_raw(task: dict) -> str:
     return ""
 
 
-def _is_troca_plano(task: dict) -> bool:
-    """Detecta se a task está no status 'Encerrado - Troca de Plano'."""
+def _normalize_status_label(text: str) -> str:
+    raw = str(text or "").strip().lower()
+    if not raw:
+        return ""
+    normalized = unicodedata.normalize("NFKD", raw)
+    normalized = "".join(ch for ch in normalized if not unicodedata.combining(ch))
+    normalized = normalized.replace("_", " ").replace("-", " ")
+    return " ".join(normalized.split())
+
+
+def _status_matches(task: dict, target_id: str, target_label: str) -> bool:
+    target_norm = _normalize_status_label(target_label)
     raw = _get_task_status_raw(task)
-    if raw == _STATUS_TROCA_PLANO:
+
+    if raw == target_id:
+        return True
+    if _normalize_status_label(raw) == target_norm:
         return True
 
-    # Tentar resolver pelo mapa de dropdowns (id -> nome)
     if raw:
         try:
             resolved = _resolve_dropdown_value(_STATUS_CF_ID, raw)
-            if resolved == "Encerrado - Troca de Plano":
+            if _normalize_status_label(resolved) == target_norm:
                 return True
         except Exception:
             pass
 
-    # Se value vier como orderindex (ex: 15), usar type_config.options
+    # Se vier como orderindex, resolver usando options.
     for cf in task.get("custom_fields", []):
         if cf.get("id") != _STATUS_CF_ID:
             continue
         val = cf.get("value")
         options = cf.get("type_config", {}).get("options", [])
         if not options:
-            # Fallback: buscar options via API (list/{id}/field)
             try:
                 from clickup_client import get_custom_field_options
                 options = get_custom_field_options(_STATUS_CF_ID)
@@ -449,27 +527,142 @@ def _is_troca_plano(task: dict) -> bool:
                 options = []
         if not options:
             break
-        try:
-            order = int(val)
-        except (TypeError, ValueError):
-            order = None
-        if order is not None and 0 <= order < len(options):
-            name = options[order].get("name", "")
-            if name == "Encerrado - Troca de Plano":
-                return True
-        else:
-            # tentar por orderindex/id no array
-            for opt in options:
-                if str(opt.get("orderindex")) == str(val) or opt.get("id") == str(val):
-                    if opt.get("name") == "Encerrado - Troca de Plano":
-                        return True
-            break
-
-    # Fallback: caso value venha como dict com name (já capturado pelo _get_task_status_raw)
-    if raw == "Encerrado - Troca de Plano":
-        return True
+        for opt in options:
+            if str(opt.get("orderindex")) == str(val) or str(opt.get("id")) == str(val):
+                if _normalize_status_label(opt.get("name", "")) == target_norm:
+                    return True
+        break
 
     return False
+
+
+def _is_troca_plano(task: dict) -> bool:
+    """Detecta se a task está no status 'Encerrado - Troca de Plano'."""
+    return _status_matches(task, _STATUS_TROCA_PLANO, _STATUS_TROCA_PLANO_LABEL)
+
+
+def _is_planejamento_black(task: dict) -> bool:
+    return _status_matches(
+        task,
+        _STATUS_PLANEJAMENTO_BLACK,
+        _STATUS_PLANEJAMENTO_BLACK_LABEL,
+    )
+
+
+def _is_planejamento_black_text(value: str) -> bool:
+    return _normalize_status_label(value) == _normalize_status_label(_STATUS_PLANEJAMENTO_BLACK_LABEL)
+
+
+def _task_list_id(task: dict) -> str:
+    return str(task.get("list_id", "") or "").strip()
+
+
+def _is_planejamento_list_task(task: dict) -> bool:
+    return _task_list_id(task) == _PLANEJAMENTO_LIST_ID
+
+
+def _task_covers_reference_month(task: dict, reference_ym: str) -> bool:
+    if len(reference_ym) < 6:
+        return False
+
+    try:
+        ref_year = int(reference_ym[:4])
+        ref_month = int(reference_ym[4:6])
+    except (TypeError, ValueError):
+        return False
+
+    if ref_year <= 0 or not (1 <= ref_month <= 12):
+        return False
+
+    ref_date = datetime(ref_year, ref_month, 1)
+    inicio = get_inicio_operacao(task)
+    fim = get_fim_operacao(task)
+
+    if inicio is not None:
+        inicio_ym = datetime(inicio.year, inicio.month, 1)
+        if inicio_ym > ref_date:
+            return False
+
+    if fim is not None:
+        fim_ym = datetime(fim.year, fim.month, 1)
+        if fim_ym < ref_date:
+            return False
+
+    return True
+
+
+def _should_use_transition_resolution(task_list: list[dict]) -> bool:
+    if len(task_list) <= 1:
+        return False
+    if any(_is_troca_plano(t) for t in task_list):
+        return True
+    return any(_is_planejamento_list_task(t) for t in task_list)
+
+
+def _is_never_joined_terminated_task(task: dict) -> bool:
+    """Task que nunca entrou na cooperativa: sem inicio/fim e status terminal específico."""
+    if get_inicio_operacao(task) is not None:
+        return False
+    if get_fim_operacao(task) is not None:
+        return False
+    return any(_status_matches(task, lbl, lbl) for lbl in _NEVER_JOINED_STATUS_LABELS)
+
+
+def _filter_out_never_joined_terminated(tasks: list[dict]) -> tuple[list[dict], int, set[str]]:
+    filtered: list[dict] = []
+    blocked = 0
+    blocked_ids: set[str] = set()
+    for t in tasks:
+        if _is_never_joined_terminated_task(t):
+            blocked += 1
+            tid = str(t.get("id", "")).strip()
+            if tid:
+                blocked_ids.add(tid)
+            continue
+        filtered.append(t)
+    return filtered, blocked, blocked_ids
+
+
+def _filter_out_planejamento_black(tasks: list[dict]) -> tuple[list[dict], int, set[str]]:
+    filtered: list[dict] = []
+    blocked = 0
+    blocked_ids: set[str] = set()
+    for t in tasks:
+        if _is_planejamento_black(t):
+            blocked += 1
+            tid = str(t.get("id", "")).strip()
+            if tid:
+                blocked_ids.add(tid)
+            continue
+        filtered.append(t)
+    return filtered, blocked, blocked_ids
+
+
+def _remove_rows_by_task_ids(ws, headers: list[str], task_ids: set[str]) -> int:
+    if not task_ids:
+        return 0
+    try:
+        task_id_col = _header_index(headers, "Task ID")
+    except ValueError:
+        return 0
+
+    existing = read_all_rows(ws)
+    if not existing:
+        return 0
+
+    kept_rows: list[list[str]] = []
+    removed = 0
+    for row in existing:
+        raw_task = str(row[task_id_col]).strip() if len(row) > task_id_col else ""
+        tid = _extract_task_id_from_link(raw_task)
+        if tid and tid in task_ids:
+            removed += 1
+            continue
+        kept_rows.append(row)
+
+    if removed > 0:
+        write_all_rows(ws, kept_rows, existing_data_rows=existing)
+    return removed
 
 
 def _build_uc_task_map(tasks: list[dict]) -> dict[str, list[dict]]:
@@ -494,61 +687,31 @@ def _build_uc_task_map(tasks: list[dict]) -> dict[str, list[dict]]:
 
 def _resolve_task_for_month(
     task_list: list[dict], reference_ym: str,
-) -> dict:
-    """Dado uma lista de tasks (ordenada por inicio_operacao) e um referenceMonth,
-    retorna a task correta para aquele mês.
+) -> dict | None:
+    """Resolve qual task representa uma UC em um mês de referência.
 
-    Regra: a task é válida para um mês se:
-      - inicio_operacao ≤ referenceMonth (ou inicio_operacao ausente)
-      - E fim_operacao ≥ referenceMonth (ou fim_operacao ausente)
-    Entre as tasks válidas, retorna a com inicio_operacao mais recente.
-
-    Só aplica lógica multi-task se pelo menos uma task tem status
-    "Encerrado - Troca de Plano". Caso contrário, retorna a última task (ativa).
+    Em modo de transição (troca de plano ou card na lista de Planejamento),
+    retorna apenas task que cobre explicitamente o mês; se não houver, retorna None.
+    Fora do modo de transição, mantém comportamento legado (última task da UC).
     """
+    if not task_list:
+        return None
     if len(task_list) == 1:
         return task_list[0]
 
-    # Verificar se há troca de plano envolvida
-    has_troca = any(_is_troca_plano(t) for t in task_list)
-    if not has_troca:
-        # comentario normalizado
-        return task_list[-1]
-
-    # Converter referenceMonth para comparação
-    ref_year = int(reference_ym[:4]) if len(reference_ym) >= 4 else 0
-    ref_month = int(reference_ym[4:6]) if len(reference_ym) >= 6 else 0
-    ref_date = datetime(ref_year, ref_month, 1) if ref_year and ref_month else None
-
-    if not ref_date:
+    # Em modo transição (troca de plano ou presença de card na lista de Planejamento),
+    # o mês só é válido se houver cobertura explícita de vigência.
+    if not _should_use_transition_resolution(task_list):
         return task_list[-1]
 
     # Encontrar a task cujo período cobre o referenceMonth
     best: dict | None = None
     for task in task_list:
-        inicio = get_inicio_operacao(task)
-        fim = get_fim_operacao(task)
+        if _task_covers_reference_month(task, reference_ym):
+            # lista está ordenada por início; o último válido é o mais recente.
+            best = task
 
-        # Verificar inicio: se preenchido, deve ser ≤ referenceMonth
-        if inicio is not None:
-            inicio_ym = datetime(inicio.year, inicio.month, 1)
-            if inicio_ym > ref_date:
-                continue  # task ainda não começou nesse mês
-
-        # Verificar fim: se preenchido, deve ser ≥ referenceMonth
-        if fim is not None:
-            fim_ym = datetime(fim.year, fim.month, 1)
-            if fim_ym < ref_date:
-                continue  # task já encerrou antes desse mês
-
-        # comentario normalizado
-        best = task
-
-    if best is not None:
-        return best
-
-    # comentario normalizado
-    return task_list[-1]
+    return best
 
 
 def _get_powerrev_date_range(tasks: list[dict]) -> tuple[str, str]:
@@ -692,146 +855,132 @@ def _build_rows_from_invoices(
     uc_to_tasks: dict[str, list[dict]],
 ) -> tuple[list[list[str]], set[tuple[str, str]]]:
     """
-    Constrói todas as linhas + placeholders para mês seguinte.
-    Retorna (rows, placeholder_keys) onde placeholder_keys = {(uc, mes_label), ...}
-
-    Para UCs com múltiplas tasks (troca de plano), cada invoice é enriquecido
-    com a task correta baseado no referenceMonth.
+    Build rows by monthly validity window (inicio/fim) up to current month + 1.
+    For months without PowerRev invoice, create one synthetic placeholder row.
     """
-
-    # Mês do placeholder: atual + 1
     now = datetime.now()
-    pm = now.month + 1
-    py = now.year
-    if pm > 12:
-        pm = 1
-        py += 1
-    placeholder_ym = f"{py}{pm:02d}"
-    placeholder_label = yyyymm_to_label(placeholder_ym)
+    upper_month = now.month + 1
+    upper_year = now.year
+    if upper_month > 12:
+        upper_month = 1
+        upper_year += 1
+    upper_ym = f"{upper_year}{upper_month:02d}"
+
+    def _ym_to_int(ym: str) -> int:
+        if not ym or len(ym) < 6:
+            return 0
+        try:
+            return int(ym[:6])
+        except Exception:
+            return 0
+
+    def _next_ym(ym: str) -> str:
+        y = int(ym[:4])
+        m = int(ym[4:6])
+        m += 1
+        if m > 12:
+            m = 1
+            y += 1
+        return f"{y}{m:02d}"
 
     def uc_sort_key(uc: str):
         task_list = uc_to_tasks.get(uc)
         if task_list:
-            # Ordenar pelo inicio_operacao da primeira task
             dt = get_inicio_operacao(task_list[0])
             return dt if dt is not None else _FAR_FUTURE
         return _FAR_FUTURE
 
-    valid_ucs = [uc for uc in uc_invoices if uc in uc_to_tasks]
-    sorted_ucs = sorted(valid_ucs, key=uc_sort_key)
-
-    skipped = len(uc_invoices) - len(sorted_ucs)
-    if skipped:
-        logger.info("PowerRev: %d UCs ignoradas (sem task no ClickUp)", skipped)
-
     all_rows: list[list[str]] = []
     placeholder_keys: set[tuple[str, str]] = set()
 
-    for uc in sorted_ucs:
-        invoices = uc_invoices[uc]
+    for uc in sorted(uc_to_tasks.keys(), key=uc_sort_key):
+        invoices = uc_invoices.get(uc, [])
         task_list = uc_to_tasks[uc]
 
-        # Calcular período coberto por todas as tasks da UC
-        # inicio_global = menor inicio_operacao de todas as tasks
-        # fim_global = maior fim_operacao (None = sem fim = ativa)
         inicio_global: datetime | None = None
         fim_global: datetime | None = None
-        has_open_end = False  # alguma task sem fim_operacao (ativa)
+        has_open_end = False
 
         for t in task_list:
             inicio = get_inicio_operacao(t)
             fim = get_fim_operacao(t)
 
-            if inicio is not None:
-                if inicio_global is None or inicio < inicio_global:
-                    inicio_global = inicio
+            if inicio is not None and (inicio_global is None or inicio < inicio_global):
+                inicio_global = inicio
 
             if fim is None:
                 has_open_end = True
-            else:
-                if fim_global is None or fim > fim_global:
-                    fim_global = fim
+            elif fim_global is None or fim > fim_global:
+                fim_global = fim
 
-        # Se alguma task não tem fim, o período é aberto (sem limite superior)
         if has_open_end:
             fim_global = None
 
-        # Filtrar invoices fora do período coberto
-        before = len(invoices)
-        filtered_invoices = []
-        for inv in invoices:
-            rm = inv.get("referenceMonth", "")
-            if not rm:
-                continue
-            # Filtrar por inicio_global
-            if inicio_global is not None:
-                inicio_ym = f"{inicio_global.year}{inicio_global.month:02d}"
-                if rm < inicio_ym:
-                    continue
-            # Filtrar por fim_global
-            if fim_global is not None:
-                fim_ym = f"{fim_global.year}{fim_global.month:02d}"
-                if rm > fim_ym:
-                    continue
-            filtered_invoices.append(inv)
-
-        dropped = before - len(filtered_invoices)
-        if dropped:
-            logger.debug(
-                "UC %s: %d invoices ignorados (fora do período %s a %s)",
-                uc, dropped,
-                f"{inicio_global.year}{inicio_global.month:02d}" if inicio_global else "?",
-                f"{fim_global.year}{fim_global.month:02d}" if fim_global else "aberto",
+        start_ym = f"{inicio_global.year}{inicio_global.month:02d}" if inicio_global else ""
+        if not start_ym:
+            invoice_months = sorted(
+                {str(inv.get("referenceMonth", "")).strip() for inv in invoices if str(inv.get("referenceMonth", "")).strip()},
             )
+            if not invoice_months:
+                continue
+            start_ym = invoice_months[0]
 
-        invoices = filtered_invoices
-        if not invoices:
+        start_int = _ym_to_int(start_ym)
+        upper_int = _ym_to_int(upper_ym)
+        if fim_global is not None:
+            fim_ym = f"{fim_global.year}{fim_global.month:02d}"
+            end_int = min(_ym_to_int(fim_ym), upper_int)
+        else:
+            end_int = upper_int
+
+        if not start_int or start_int > end_int:
             continue
 
-        # Ordenar invoices por referenceMonth
-        invoices.sort(key=lambda i: i.get("referenceMonth", ""))
-
-        # Calcular meses únicos para Mês de Atendimento
-        unique_months: list[str] = []
+        invoices_by_month: dict[str, list[dict]] = {}
         for inv in invoices:
-            rm = inv.get("referenceMonth", "")
-            if rm and rm not in unique_months:
-                unique_months.append(rm)
+            rm = str(inv.get("referenceMonth", "")).strip()
+            if not rm:
+                continue
+            invoices_by_month.setdefault(rm, []).append(inv)
 
-        # comentario normalizado
-        for inv in invoices:
-            rm = inv.get("referenceMonth", "")
-            mes_atendimento = unique_months.index(rm) + 1 if rm in unique_months else 0
-            task = _resolve_task_for_month(task_list, rm)
-            row = build_row(task, inv, mes_atendimento)
-            all_rows.append(row)
+        attendance_counter = 0
+        ym = start_ym
+        while _ym_to_int(ym) <= end_int:
+            task = _resolve_task_for_month(task_list, ym)
+            if task is not None:
+                attendance_counter += 1
+                month_invoices = invoices_by_month.get(ym, [])
+                if month_invoices:
+                    month_invoices.sort(
+                        key=lambda inv: (
+                            str(inv.get("issueDate", "")).strip(),
+                            str(inv.get("invoiceId", "")).strip(),
+                        ),
+                    )
+                    for inv in month_invoices:
+                        all_rows.append(build_row(task, inv, attendance_counter))
+                else:
+                    placeholder_invoice = {
+                        "referenceMonth": ym,
+                        "status": "",
+                        "issueDate": "",
+                        "total": 0.0,
+                        "invoiceId": "",
+                        "providerName": "",
+                    }
+                    all_rows.append(build_row(task, placeholder_invoice, attendance_counter))
+                    placeholder_keys.add((uc, yyyymm_to_label(ym)))
 
-        # Gerar placeholder se necessário
-        if fim_global and (fim_global.year, fim_global.month) < (py, pm):
-            continue  # cooperado encerrou antes do mês do placeholder
-
-        if placeholder_ym in unique_months:
-            continue  # já tem fatura real pra esse mês
-
-        placeholder_invoice = {
-            "referenceMonth": placeholder_ym,
-            "status": "",
-            "issueDate": "",
-            "total": 0.0,
-        }
-        mes_atendimento = len(unique_months) + 1
-        # Placeholder usa a task mais recente (ativa)
-        task = _resolve_task_for_month(task_list, placeholder_ym)
-        row = build_row(task, placeholder_invoice, mes_atendimento)
-        all_rows.append(row)
-        placeholder_keys.add((uc, placeholder_label))
+            ym = _next_ym(ym)
 
     if placeholder_keys:
-        logger.info("Placeholders: %d linhas '%s' geradas para %s",
-                     len(placeholder_keys), _NAO_PROCESSADO, placeholder_label)
+        logger.info(
+            "Placeholders: %d linhas '%s' geradas (sem fatura ate mes atual+1).",
+            len(placeholder_keys),
+            _NAO_PROCESSADO,
+        )
 
     return all_rows, placeholder_keys
-
 
 def _delta_powerrev_check(ws, headers: list[str]) -> None:
     """
@@ -872,15 +1021,15 @@ def _delta_powerrev_check(ws, headers: list[str]) -> None:
         return
 
     existing_rows = read_all_rows(ws)
-    uc_col = headers.index("UC")
-    mes_col = headers.index("Mês de Referencia")
-    status_fat_col = headers.index("Status de faturamento")
-    emissao_col = headers.index("Data de Emissão da fatura")
-    valor_col = headers.index("Valor do boleto")
-    val_col = headers.index("Validação")
-    invoice_col = headers.index("Invoice ID") if "Invoice ID" in headers else None
-    provider_col = headers.index("Provider") if "Provider" in headers else None
-    parent_col = headers.index("Parentesco agrupado") if "Parentesco agrupado" in headers else None
+    uc_col = _header_index(headers, "UC")
+    mes_col = _header_index(headers, "MÃªs de Referencia", "Mes de Referencia", "MÃƒÂªs de Referencia")
+    status_fat_col = _header_index(headers, "Status de faturamento")
+    emissao_col = _header_index(headers, "Data de EmissÃ£o da fatura", "Data de Emissao da fatura", "Data de EmissÃƒÂ£o da fatura")
+    valor_col = _header_index(headers, "Valor do boleto")
+    val_col = _header_index(headers, "ValidaÃ§Ã£o", "Validacao", "ValidaÃƒÂ§ÃƒÂ£o")
+    invoice_col = _header_index(headers, "Invoice ID") if _has_header(headers, "Invoice ID") else None
+    provider_col = _header_index(headers, "Provider") if _has_header(headers, "Provider") else None
+    parent_col = COLUMN_ORDER.index("parentesco_agrupado") if "parentesco_agrupado" in COLUMN_ORDER else None
 
     months_to_check_set = set(months_to_check)
 
@@ -916,7 +1065,6 @@ def _delta_powerrev_check(ws, headers: list[str]) -> None:
     def _secondary_key_delta(
         uc: str,
         yyyymm: str,
-        parent_grouped_uc: str,
         issue_date: str,
         provider_name: str,
         status: str,
@@ -929,7 +1077,6 @@ def _delta_powerrev_check(ws, headers: list[str]) -> None:
             "SKD",
             uc.strip(),
             yyyymm.strip(),
-            str(parent_grouped_uc or "").strip(),
             str(issue_date or "").strip(),
             str(provider_name or "").strip(),
             str(status or "").strip(),
@@ -977,7 +1124,6 @@ def _delta_powerrev_check(ws, headers: list[str]) -> None:
         secondary = str(inv.get("rowKey") or "").strip() or _secondary_key_delta(
             uc=uc,
             yyyymm=ref,
-            parent_grouped_uc=inv.get("parentGroupedUc", ""),
             issue_date=inv.get("issueDate", ""),
             provider_name=inv.get("providerName", ""),
             status=inv.get("status", ""),
@@ -990,7 +1136,7 @@ def _delta_powerrev_check(ws, headers: list[str]) -> None:
         if secondary:
             inv_secondary_map[secondary].append(idx)
 
-    compact_sheet_rows: list[tuple[int, str, str, str, str, str]] = []
+    compact_sheet_rows: list[tuple[int, str, str, str, str, str, list[str]]] = []
     required_len = max(uc_col, mes_col)
     for i, row in enumerate(existing_rows):
         if len(row) <= required_len:
@@ -1014,20 +1160,23 @@ def _delta_powerrev_check(ws, headers: list[str]) -> None:
         row_secondary = _secondary_key_delta(
             uc=uc,
             yyyymm=ref,
-            parent_grouped_uc=(row[parent_col] if parent_col is not None and len(row) > parent_col else ""),
             issue_date=(row[emissao_col] if len(row) > emissao_col else ""),
             provider_name=(row[provider_col] if provider_col is not None and len(row) > provider_col else ""),
             status=(row[status_fat_col] if len(row) > status_fat_col else ""),
             total=(row[valor_col] if len(row) > valor_col else ""),
         )
-        compact_sheet_rows.append((i + 2, uc, ref, current_q, invoice_id, row_secondary))
+        compact_sheet_rows.append((i + 2, uc, ref, current_q, invoice_id, row_secondary, row))
 
-    del existing_rows
-
-    updates: dict[int, dict[int, str]] = {}
+    updates: dict[int, dict[int, object]] = {}
     consumed_invoices: set[int] = set()
 
-    for sheet_row, uc, ref, current_q, invoice_id, row_secondary in compact_sheet_rows:
+    rows_evaluated = len(compact_sheet_rows)
+    rows_matched = 0
+    rows_no_match = 0
+    rows_unchanged = 0
+    changed_details: list[tuple[str, str]] = []
+
+    for sheet_row, uc, ref, current_q, invoice_id, row_secondary, current_row in compact_sheet_rows:
         primary = _primary_key_delta(uc, ref, invoice_id)
         fallback = _fallback_key_delta(uc, ref)
 
@@ -1044,28 +1193,91 @@ def _delta_powerrev_check(ws, headers: list[str]) -> None:
                 match_idx = _pop_unique_unmatched(inv_fallback_map, fallback, consumed_invoices)
 
         if match_idx is None:
+            rows_no_match += 1
             if current_q != _NAO_PROCESSADO:
-                updates.setdefault(sheet_row, {})[val_col] = _ERRO_SISTEMA
+                proposed = {val_col: _ERRO_SISTEMA}
+                effective, diffs = _build_effective_updates(
+                    row=current_row,
+                    proposed=proposed,
+                    headers=headers,
+                )
+                if effective:
+                    updates[sheet_row] = effective
+                    mes_label = _get_row_cell_value(current_row, mes_col)
+                    detail_text = (
+                        f"linha={sheet_row} | UC={uc or '[vazio]'} | MesRef={mes_label or '[vazio]'} | "
+                        + "; ".join(diffs)
+                    )
+                    changed_details.append((uc or "[vazio]", detail_text))
+                else:
+                    rows_unchanged += 1
+            else:
+                rows_unchanged += 1
             continue
 
+        rows_matched += 1
         inv = all_invoices[match_idx]
-        col_updates: dict[int, str | float] = {}
-        col_updates[status_fat_col] = inv.get("status") or ""
-        col_updates[emissao_col] = inv.get("issueDate") or ""
-        total_val = inv.get("total")
-        col_updates[valor_col] = "" if total_val is None else total_val
-        col_updates[val_col] = ""
-        updates[sheet_row] = col_updates
+        proposed: dict[int, object] = {
+            uc_col: str(inv.get("uc", "")).strip(),
+            mes_col: yyyymm_to_label(str(inv.get("referenceMonth", "")).strip()),
+            status_fat_col: inv.get("status") or "",
+            emissao_col: inv.get("issueDate") or "",
+            valor_col: "" if inv.get("total") is None else inv.get("total"),
+            val_col: "",
+        }
+        if provider_col is not None:
+            proposed[provider_col] = inv.get("providerName") or ""
+        if invoice_col is not None:
+            proposed[invoice_col] = inv.get("invoiceId") or ""
+
+        effective, diffs = _build_effective_updates(
+            row=current_row,
+            proposed=proposed,
+            headers=headers,
+            money_cols={valor_col},
+        )
+        if not effective:
+            rows_unchanged += 1
+            continue
+
+        updates[sheet_row] = effective
+        log_uc = str(proposed.get(uc_col) or _get_row_cell_value(current_row, uc_col)).strip()
+        log_mes = str(proposed.get(mes_col) or _get_row_cell_value(current_row, mes_col)).strip()
+        detail_text = (
+            f"linha={sheet_row} | UC={log_uc or '[vazio]'} | MesRef={log_mes or '[vazio]'} | "
+            + "; ".join(diffs)
+        )
+        changed_details.append((log_uc or "[vazio]", detail_text))
 
     if updates:
         update_columns_in_place(ws, updates)
-        q_cleared = sum(1 for cols in updates.values() if val_col in cols and cols[val_col] == "")
+        q_cleared = sum(
+            1
+            for cols in updates.values()
+            if val_col in cols and str(cols[val_col]).strip() == ""
+        )
         q_erro = sum(1 for cols in updates.values() if val_col in cols and cols[val_col] == _ERRO_SISTEMA)
         logger.info(
-            "Delta PowerRev: %d linhas atualizadas (%d Q limpo, %d Q erro).",
+            "Delta PowerRev: linhas avaliadas=%d, com_match=%d, alteradas=%d, sem_alteracao=%d, sem_match=%d",
+            rows_evaluated,
+            rows_matched,
             len(updates),
+            rows_unchanged,
+            rows_no_match,
+        )
+        logger.info(
+            "Delta PowerRev: alteracoes em validacao -> Q limpo=%d, Q erro=%d.",
             q_cleared,
             q_erro,
+        )
+        _emit_delta_change_logs("Delta PowerRev ALTERACAO", changed_details, summary_threshold=3)
+    else:
+        logger.info(
+            "Delta PowerRev: linhas avaliadas=%d, com_match=%d, alteradas=0, sem_alteracao=%d, sem_match=%d",
+            rows_evaluated,
+            rows_matched,
+            rows_unchanged,
+            rows_no_match,
         )
 
     new_count = sum(
@@ -1077,42 +1289,56 @@ def _delta_powerrev_check(ws, headers: list[str]) -> None:
 
     if new_count:
         logger.info(
-            "Delta PowerRev: %d faturas sem linha (incluídas no próximo full sync)",
+            "Delta PowerRev: %d faturas sem linha (incluidas no proximo full sync)",
             new_count,
         )
 
-    del compact_sheet_rows, inv_primary_map, inv_fallback_map, inv_secondary_map, consumed_invoices, updates, all_invoices
+    del compact_sheet_rows, inv_primary_map, inv_fallback_map, inv_secondary_map, consumed_invoices, updates, all_invoices, existing_rows, changed_details
     force_free_memory()
-
 
 def _delta_clickup_update(ws, headers: list[str], updated_tasks: list[dict]) -> None:
     """
     Atualiza campos do ClickUp nas linhas existentes.
-    Toca colunas ClickUp (B, D, I, J, K, S), preserva o resto.
+    Toca colunas ClickUp e fim de operação, preserva o resto.
     """
     if not updated_tasks:
         return
 
-    task_id_col = headers.index("Task ID")
-    task_id_values = read_column_values(ws, task_id_col)
+    task_id_col = _header_index(headers, "Task ID")
+    mes_ref_col = _header_index(headers, "Mês de Referencia", "Mes de Referencia", "MÃƒÂªs de Referencia")
+    envio_col = _header_index(headers, "Envio do boleto")
+    data_venc_col = _header_index(headers, "Data de Vencimento")
+
+    existing_rows = read_all_rows(ws)
+    if not existing_rows:
+        return
 
     # Mapear task_id para linhas na planilha
     task_rows: dict[str, list[int]] = {}
-    for i, cell_value in enumerate(task_id_values):
-        tid = _extract_task_id_from_link(str(cell_value))
+    row_by_sheet: dict[int, list[str]] = {}
+    mes_ref_by_row: dict[int, str] = {}
+    for i, row in enumerate(existing_rows):
+        sheet_row = i + 2
+        row_by_sheet[sheet_row] = row
+        raw_task_value = str(row[task_id_col]).strip() if len(row) > task_id_col else ""
+        tid = _extract_task_id_from_link(raw_task_value)
         if tid:
-            task_rows.setdefault(tid, []).append(i + 2)
+            task_rows.setdefault(tid, []).append(sheet_row)
+        mes_ref_by_row[sheet_row] = str(row[mes_ref_col]).strip() if len(row) > mes_ref_col else ""
 
     # Colunas ClickUp a atualizar
-    status_col = headers.index("Status Detalhado")
-    razao_col = headers.index("Razão Social")
-    plano_col = headers.index("Plano de Adesão")
-    dist_col = headers.index("Distribuidora")
-    tipo_col = headers.index("Tipo de faturamento")
-    obs_col = headers.index("Observações ClickUp")
+    status_col = _header_index(headers, "Status Detalhado")
+    uc_col = _header_index(headers, "UC")
+    razao_col = _header_index(headers, "Razão Social", "Razao Social", "RazÃƒÂ£o Social")
+    plano_col = _header_index(headers, "Plano de Adesão", "Plano de Adesao", "Plano de AdesÃƒÂ£o")
+    dist_col = _header_index(headers, "Distribuidora")
+    tipo_col = _header_index(headers, "Tipo de faturamento")
+    obs_col = _header_index(headers, "Observações ClickUp", "Observacoes ClickUp", "ObservaÃƒÂ§ÃƒÂµes ClickUp")
+    fim_operacao_col = COLUMN_ORDER.index("parentesco_agrupado") if "parentesco_agrupado" in COLUMN_ORDER else None
 
     clickup_cols = {
         "status": status_col,
+        "uc": uc_col,
         "razao_social": razao_col,
         "plano": plano_col,
         "distribuidora": dist_col,
@@ -1120,6 +1346,9 @@ def _delta_clickup_update(ws, headers: list[str], updated_tasks: list[dict]) -> 
     }
 
     updates: dict[int, dict[int, str]] = {}
+    changed_details: list[tuple[str, str]] = []
+    evaluated_rows = 0
+    unchanged_rows = 0
 
     for task in updated_tasks:
         tid = task.get("id", "")
@@ -1128,32 +1357,228 @@ def _delta_clickup_update(ws, headers: list[str], updated_tasks: list[dict]) -> 
             continue
 
         # Extrair valores atuais dos campos ClickUp
-        values: dict[int, str] = {}
+        base_values: dict[int, str] = {}
         for key, col_idx in clickup_cols.items():
             val = _extract_field_value(task, key)
             # Requisito: valores vazios também devem atualizar (limpar célula).
-            values[col_idx] = val if val is not None else ""
+            base_values[col_idx] = val if val is not None else ""
+
         # Observações: campo computed, precisa de lógica própria
         obs_val = _build_observacoes(task)
-        values[obs_col] = obs_val  # sempre atualizar (pode limpar)
+        base_values[obs_col] = obs_val  # sempre atualizar (pode limpar)
+        if fim_operacao_col is not None:
+            base_values[fim_operacao_col] = get_fim_operacao_display(task)
 
-        if values:
+        if base_values:
             for sheet_row in rows_for_task:
-                updates[sheet_row] = values
+                evaluated_rows += 1
+                row_values = dict(base_values)
+                mes_label = mes_ref_by_row.get(sheet_row, "")
+                row_values[envio_col] = compute_envio_boleto_for_task(task, mes_label)
+                row_values[data_venc_col] = compute_data_vencimento_for_task(task, mes_label)
+
+                current_row = row_by_sheet.get(sheet_row, [])
+                effective, diffs = _build_effective_updates(
+                    row=current_row,
+                    proposed=row_values,
+                    headers=headers,
+                )
+                if not effective:
+                    unchanged_rows += 1
+                    continue
+
+                updates[sheet_row] = effective
+                log_uc = _get_row_cell_value(current_row, uc_col) or str(effective.get(uc_col, "")).strip()
+                log_mes = mes_label or _get_row_cell_value(current_row, mes_ref_col)
+                detail_text = (
+                    f"linha={sheet_row} | UC={log_uc or '[vazio]'} | MesRef={log_mes or '[vazio]'} | "
+                    + "; ".join(diffs)
+                )
+                changed_details.append((log_uc or "[vazio]", detail_text))
 
     if updates:
         update_columns_in_place(ws, updates)
-        logger.info("Delta ClickUp: %d linhas atualizadas", len(updates))
+        logger.info(
+            "Delta ClickUp: linhas avaliadas=%d, alteradas=%d, sem_alteracao=%d",
+            evaluated_rows,
+            len(updates),
+            unchanged_rows,
+        )
+        _emit_delta_change_logs("Delta ClickUp ALTERACAO", changed_details, summary_threshold=3)
+    else:
+        logger.info(
+            "Delta ClickUp: linhas avaliadas=%d, alteradas=0, sem_alteracao=%d",
+            evaluated_rows,
+            unchanged_rows,
+        )
 
-    del task_id_values, task_rows, updates
+    del existing_rows, task_rows, row_by_sheet, mes_ref_by_row, updates, changed_details
     force_free_memory()
 
+def _normalize_int_text(value: object) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    try:
+        return str(int(float(text)))
+    except (TypeError, ValueError):
+        return text
+
+
+def _normalize_money_compare(value: object) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    cleaned = re.sub(r"[^0-9,.\-]", "", text)
+    if not cleaned:
+        return ""
+    if "," in cleaned and "." in cleaned:
+        if cleaned.rfind(",") > cleaned.rfind("."):
+            cleaned = cleaned.replace(".", "").replace(",", ".")
+        else:
+            cleaned = cleaned.replace(",", "")
+    elif "," in cleaned:
+        cleaned = cleaned.replace(".", "").replace(",", ".")
+    try:
+        return f"{float(cleaned):.2f}"
+    except (TypeError, ValueError):
+        return cleaned
+
+
+def _get_row_cell_value(row: list[str], col_idx: int) -> str:
+    if col_idx < 0 or len(row) <= col_idx:
+        return ""
+    return str(row[col_idx]).strip()
+
+
+def _format_log_value(value: object) -> str:
+    text = str(value or "").strip()
+    return text if text else "[vazio]"
+
+
+def _build_effective_updates(
+    *,
+    row: list[str],
+    proposed: dict[int, object],
+    headers: list[str],
+    money_cols: set[int] | None = None,
+) -> tuple[dict[int, object], list[str]]:
+    """Mantem apenas mudancas reais e retorna texto de diff para log."""
+    effective: dict[int, object] = {}
+    diffs: list[str] = []
+    money_cols = money_cols or set()
+
+    for col_idx, new_val in proposed.items():
+        old_text = _get_row_cell_value(row, col_idx)
+        new_text = str(new_val or "").strip()
+
+        if col_idx in money_cols:
+            same = _normalize_money_compare(old_text) == _normalize_money_compare(new_text)
+        else:
+            same = old_text == new_text
+
+        if same:
+            continue
+
+        effective[col_idx] = new_val
+        col_name = headers[col_idx] if 0 <= col_idx < len(headers) else f"C{col_idx + 1}"
+        diffs.append(f"{col_name}: {_format_log_value(old_text)} -> {_format_log_value(new_text)}")
+
+    return effective, diffs
+
+
+def _emit_delta_change_logs(prefix: str, details: list[tuple[str, str]], summary_threshold: int = 3) -> None:
+    """
+    Emite logs detalhados de alteracao no delta.
+    Se uma UC tiver mais de `summary_threshold` alteracoes, loga apenas resumo por UC.
+    """
+    if not details:
+        return
+
+    by_uc: dict[str, list[str]] = defaultdict(list)
+    uc_order: list[str] = []
+    for uc, detail in details:
+        uc_key = str(uc or "[vazio]").strip() or "[vazio]"
+        if uc_key not in by_uc:
+            uc_order.append(uc_key)
+        by_uc[uc_key].append(detail)
+
+    for uc in uc_order:
+        uc_details = by_uc.get(uc, [])
+        if len(uc_details) > summary_threshold:
+            logger.info("%s | UC %s teve mudanca em diversas linhas (%d).", prefix, uc, len(uc_details))
+            continue
+        for detail in uc_details:
+            logger.info("%s | %s", prefix, detail)
+
+
+def _recompute_mes_atendimento(ws, headers: list[str]) -> int:
+    """Recalcula coluna de Mês de atandimento com base em UC + Mês de Referencia."""
+    try:
+        uc_col = _header_index(headers, "UC")
+        mes_ref_col = _header_index(headers, "MÃƒÂªs de Referencia", "Mes de Referencia", "MÃƒÆ’Ã‚Âªs de Referencia")
+        mes_at_col = _header_index(
+            headers,
+            "MÃƒÂªs de atandimento",
+            "Mes de atandimento",
+            "Mês de atandimento",
+            "Mes de atendimento",
+            "Mês de atendimento",
+        )
+    except Exception:
+        return 0
+
+    rows = read_all_rows(ws)
+    if not rows:
+        return 0
+
+    months_by_uc: dict[str, set[str]] = defaultdict(set)
+    row_refs: list[tuple[int, str, str, str]] = []
+
+    for idx, row in enumerate(rows):
+        sheet_row = idx + 2
+        uc = str(row[uc_col]).strip() if len(row) > uc_col else ""
+        mes_label = str(row[mes_ref_col]).strip() if len(row) > mes_ref_col else ""
+        ref_ym = label_to_yyyymm(mes_label)
+        if not uc or not ref_ym:
+            continue
+        months_by_uc[uc].add(ref_ym)
+        current = str(row[mes_at_col]).strip() if len(row) > mes_at_col else ""
+        row_refs.append((sheet_row, uc, ref_ym, current))
+
+    if not row_refs:
+        return 0
+
+    rank_by_uc: dict[str, dict[str, int]] = {}
+    for uc, months in months_by_uc.items():
+        sorted_months = sorted(months)
+        rank_by_uc[uc] = {ym: i + 1 for i, ym in enumerate(sorted_months)}
+
+    updates: dict[int, dict[int, str]] = {}
+    changed_details: list[tuple[str, str]] = []
+    for sheet_row, uc, ref_ym, current in row_refs:
+        expected = str(rank_by_uc[uc][ref_ym])
+        if _normalize_int_text(current) != expected:
+            updates.setdefault(sheet_row, {})[mes_at_col] = expected
+            detail_text = (
+                f"linha={sheet_row} | UC={uc or '[vazio]'} | MesRef={yyyymm_to_label(ref_ym) or '[vazio]'} | "
+                f"{headers[mes_at_col]}: {_format_log_value(current)} -> {_format_log_value(expected)}"
+            )
+            changed_details.append((uc or "[vazio]", detail_text))
+
+    if updates:
+        update_columns_in_place(ws, updates)
+        logger.info("Delta: %d linhas com Mês de atandimento recalculado.", len(updates))
+        _emit_delta_change_logs("Delta MesAtendimento ALTERACAO", changed_details, summary_threshold=3)
+
+    return len(updates)
 
 def _merge_with_disappeared(
     new_rows: list[list[str]],
     ws,
     headers: list[str],
     uc_to_tasks: dict[str, list[dict]] | None = None,
+    blocked_task_ids: set[str] | None = None,
 ) -> tuple[list[list[str]], dict[int, dict[int, str]], list[list[str]]]:
     """
     Preserva linhas cujo invoice sumiu da PowerRev.
@@ -1171,19 +1596,25 @@ def _merge_with_disappeared(
         _primary_key,
     )
 
-    uc_idx = headers.index("UC")
-    mes_idx = headers.index("Mês de Referencia")
-    val_idx = headers.index("Validação")
-    status_fat_idx = headers.index("Status de faturamento")
-    valor_idx = headers.index("Valor do boleto")
-    obs_idx = headers.index("Observações")
-    val_final_idx = headers.index("Valor final")
-    emiss_final_idx = headers.index("Data de emissão final")
+    uc_idx = _header_index(headers, "UC")
+    mes_idx = _header_index(headers, "Mês de Referencia", "Mes de Referencia", "MÃªs de Referencia")
+    val_idx = _header_index(headers, "Validação", "Validacao", "ValidaÃ§Ã£o")
+    status_fat_idx = _header_index(headers, "Status de faturamento")
+    status_det_idx = _header_index(headers, "Status Detalhado")
+    task_id_idx = _header_index(headers, "Task ID") if _has_header(headers, "Task ID") else None
+    valor_idx = _header_index(headers, "Valor do boleto")
+    obs_idx = _header_index(headers, "Observações", "Observacoes", "ObservaÃ§Ãµes")
+    val_final_idx = _header_index(headers, "Valor final")
+    emiss_final_idx = _header_index(headers, "Data de emissão final", "Data de emissao final", "Data de emissÃ£o final")
 
-    invoice_idx = headers.index("Invoice ID") if "Invoice ID" in headers else None
-    provider_idx = headers.index("Provider") if "Provider" in headers else None
-    issue_idx = headers.index("Data de Emissão da fatura") if "Data de Emissão da fatura" in headers else None
-    parent_idx = headers.index("Parentesco agrupado") if "Parentesco agrupado" in headers else None
+    invoice_idx = _header_index(headers, "Invoice ID") if _has_header(headers, "Invoice ID") else None
+    provider_idx = _header_index(headers, "Provider") if _has_header(headers, "Provider") else None
+    issue_idx = (
+        _header_index(headers, "Data de Emissão da fatura", "Data de Emissao da fatura", "Data de EmissÃ£o da fatura")
+        if _has_header(headers, "Data de Emissão da fatura", "Data de Emissao da fatura", "Data de EmissÃ£o da fatura")
+        else None
+    )
+    parent_idx = COLUMN_ORDER.index("parentesco_agrupado") if "parentesco_agrupado" in COLUMN_ORDER else None
 
     def _row_value_local(row: list[str], idx: int | None) -> str:
         if idx is None or idx < 0 or len(row) <= idx:
@@ -1213,7 +1644,6 @@ def _merge_with_disappeared(
         uc = _row_value_local(row, uc_idx)
         if not uc or not yyyymm:
             return ""
-        parent = _row_value_local(row, parent_idx)
         issue = _row_value_local(row, issue_idx)
         provider = _row_value_local(row, provider_idx)
         status = _row_value_local(row, status_fat_idx)
@@ -1222,7 +1652,6 @@ def _merge_with_disappeared(
             "SKD",
             uc,
             yyyymm,
-            parent,
             issue,
             provider,
             status,
@@ -1246,15 +1675,16 @@ def _merge_with_disappeared(
         secondary_key = _secondary_key_local(row, yyyymm=yyyymm)
         return _fallback_key(uc, mes), _primary_key(uc, mes, invoice_id), invoice_id, secondary_key
 
-    def _has_protected_values(row: list[str]) -> bool:
-        for idx in (obs_idx, val_final_idx, emiss_final_idx):
-            if len(row) > idx and str(row[idx]).strip():
-                return True
-        return False
-
     existing = read_all_rows(ws)
     if not existing:
         return new_rows, {}, existing
+
+    new_uc_mes_keys: set[tuple[str, str]] = set()
+    for row in new_rows:
+        new_uc = _row_value_local(row, uc_idx)
+        new_mes = _row_value_local(row, mes_idx)
+        if new_uc and new_mes:
+            new_uc_mes_keys.add((new_uc, new_mes))
 
     def _is_within_uc_period(uc: str, yyyymm: str) -> bool:
         if not uc_to_tasks:
@@ -1262,6 +1692,9 @@ def _merge_with_disappeared(
         task_list = uc_to_tasks.get(uc)
         if not task_list or not yyyymm:
             return True
+
+        if _should_use_transition_resolution(task_list):
+            return any(_task_covers_reference_month(t, yyyymm) for t in task_list)
 
         inicio_global: datetime | None = None
         fim_global: datetime | None = None
@@ -1343,11 +1776,32 @@ def _merge_with_disappeared(
 
     disappeared_by_uc: dict[str, list[list[str]]] = {}
     disappeared_row_ids: set[int] = set()
+    dropped_redundant_missing = 0
+    dropped_planejamento_black = 0
+    dropped_blocked_task = 0
+    dropped_redundant_placeholder = 0
+    blocked_task_ids = {str(tid).strip() for tid in (blocked_task_ids or set()) if str(tid).strip()}
 
     for row in existing:
+        if blocked_task_ids:
+            row_task_id = _extract_task_id_from_link(_row_value_local(row, task_id_idx))
+            if row_task_id and row_task_id in blocked_task_ids:
+                dropped_blocked_task += 1
+                continue
+
         uc = _row_value_local(row, uc_idx)
         mes = _row_value_local(row, mes_idx)
         if not uc or not mes:
+            continue
+
+        # Não preservar linhas legadas com Status Detalhado = Planejamento - Black.
+        if _is_planejamento_black_text(_row_value_local(row, status_det_idx)):
+            dropped_planejamento_black += 1
+            continue
+
+        # Compatibilidade retroativa: remover linhas mãe legadas do grouped.
+        parent_value = _row_value_local(row, parent_idx)
+        if parent_value.upper().startswith("UC M"):
             continue
 
         fallback_key, primary_key, invoice_id, secondary_key = _row_keys(row)
@@ -1372,11 +1826,22 @@ def _merge_with_disappeared(
         if match_idx is not None:
             continue  # linha existente já foi correspondida com linha nova
 
-        yyyymm = label_to_yyyymm(mes)
-        has_protected = _has_protected_values(row)
+        # Regra de limpeza:
+        # se a linha antiga for "Sem Fatura Distribuidora" e já existir qualquer
+        # linha nova para o mesmo UC/mês, descarta a antiga (não preservar como erro).
+        if _is_missing_distributor_status(_row_value_local(row, status_fat_idx)) and (uc, mes) in new_uc_mes_keys:
+            dropped_redundant_missing += 1
+            continue
+        # Se havia placeholder (Q='Não processado') e agora existe linha nova para o mesmo UC/mês,
+        # descarta a linha antiga para evitar sobra em meses que passaram a ter faturas.
+        if _row_value_local(row, val_idx) == _NAO_PROCESSADO and (uc, mes) in new_uc_mes_keys:
+            dropped_redundant_placeholder += 1
+            continue
 
-        # Requisito crítico: se L/N/P já teve valor, a linha deve permanecer sempre.
-        if (not has_protected) and yyyymm and (not _is_within_uc_period(uc, yyyymm)):
+        yyyymm = label_to_yyyymm(mes)
+
+        # Regra vigente: nada fora da vigencia deve aparecer na planilha.
+        if yyyymm and (not _is_within_uc_period(uc, yyyymm)):
             continue
 
         preserved = [str(v) for v in row[:WRITE_COL_COUNT]]
@@ -1385,6 +1850,28 @@ def _merge_with_disappeared(
         preserved[val_idx] = ""  # q_marks escreve o status de erro depois
         disappeared_by_uc.setdefault(uc, []).append(preserved)
         disappeared_row_ids.add(id(preserved))
+
+    if dropped_redundant_missing:
+        logger.info(
+            "Regra MDI (merge): removidas %d linhas antigas redundantes de 'Sem Fatura Distribuidora'.",
+            dropped_redundant_missing,
+        )
+    if dropped_planejamento_black:
+        logger.info(
+            "Regra Status (merge): removidas %d linhas antigas de '%s'.",
+            dropped_planejamento_black,
+            _STATUS_PLANEJAMENTO_BLACK_LABEL,
+        )
+    if dropped_blocked_task:
+        logger.info(
+            "Regra Status (merge): removidas %d linhas antigas por Task ID bloqueada.",
+            dropped_blocked_task,
+        )
+    if dropped_redundant_placeholder:
+        logger.info(
+            "Regra Placeholder (merge): removidas %d linhas antigas de 'Nao processado' substituidas por linha nova.",
+            dropped_redundant_placeholder,
+        )
 
     if not disappeared_row_ids:
         return new_rows, {}, existing
@@ -1433,7 +1920,21 @@ def full_sync() -> None:
 
     # 1. Fetch ClickUp (já slim)
     tasks = fetch_all_tasks(include_closed=True, transform=slim_task)
+    tasks, blocked_black_count, blocked_black_ids = _filter_out_planejamento_black(tasks)
+    tasks, blocked_never_joined_count, blocked_never_joined_ids = _filter_out_never_joined_terminated(tasks)
+    blocked_task_ids_full = set(blocked_black_ids) | set(blocked_never_joined_ids)
     logger.info("Total tasks recebidas: %d", len(tasks))
+    if blocked_black_count:
+        logger.info(
+            "Filtro Status Detalhado: %d tasks ignoradas por '%s'.",
+            blocked_black_count,
+            _STATUS_PLANEJAMENTO_BLACK_LABEL,
+        )
+    if blocked_never_joined_count:
+        logger.info(
+            "Filtro Status Detalhado: %d tasks ignoradas por status terminal sem início/fim de operação.",
+            blocked_never_joined_count,
+        )
     log_memory("Pós-fetch ClickUp (slim)")
 
     _known_task_ids = {t.get("id", "") for t in tasks if t.get("id")}
@@ -1452,6 +1953,8 @@ def full_sync() -> None:
 
     # Busca SEM slim_task para ter acesso ao campo list.id
     fallback_count = 0
+    fallback_blocked_black_count = 0
+    fallback_blocked_never_joined_count = 0
     fallback_seen = 0
     for t in iter_team_tasks_with_uc(uc_cf_id):
         fallback_seen += 1
@@ -1460,6 +1963,18 @@ def full_sync() -> None:
         # Só aceitar tasks cuja home list está nas listas permitidas
         task_list_id = t.get("list", {}).get("id", "")
         if task_list_id not in allowed_lists:
+            continue
+        if _is_planejamento_black(t):
+            fallback_blocked_black_count += 1
+            tid = str(t.get("id", "")).strip()
+            if tid:
+                blocked_task_ids_full.add(tid)
+            continue
+        if _is_never_joined_terminated_task(t):
+            fallback_blocked_never_joined_count += 1
+            tid = str(t.get("id", "")).strip()
+            if tid:
+                blocked_task_ids_full.add(tid)
             continue
 
         uc = extract_task_uc(t)
@@ -1475,14 +1990,25 @@ def full_sync() -> None:
             fallback_count += 1
         else:
             # comentario normalizado
-                existing_ids = {et.get("id", "") for et in uc_to_task[uc]}
-                if tid not in existing_ids:
-                    uc_to_task[uc].append(slimmed)
-                    _known_task_ids.add(tid)
-                    fallback_count += 1
+            existing_ids = {et.get("id", "") for et in uc_to_task[uc]}
+            if tid not in existing_ids:
+                uc_to_task[uc].append(slimmed)
+                _known_task_ids.add(tid)
+                fallback_count += 1
     force_free_memory()
     if fallback_count:
         logger.info("Fallback ClickUp: %d tasks extras recuperadas do workspace.", fallback_count)
+    if fallback_blocked_black_count:
+        logger.info(
+            "Fallback ClickUp: %d tasks ignoradas por '%s'.",
+            fallback_blocked_black_count,
+            _STATUS_PLANEJAMENTO_BLACK_LABEL,
+        )
+    if fallback_blocked_never_joined_count:
+        logger.info(
+            "Fallback ClickUp: %d tasks ignoradas por status terminal sem início/fim de operação.",
+            fallback_blocked_never_joined_count,
+        )
     logger.info("Fallback ClickUp: %d tasks com UC analisadas (streaming).", fallback_seen)
 
     # Re-ordenar listas com múltiplas tasks por inicio_operacao
@@ -1528,7 +2054,13 @@ def full_sync() -> None:
         headers = get_headers()
         # Sem dados novos, mas preservar linhas existentes como "Erro no sistema"
         rows_empty: list[list[str]] = []
-        rows_empty, q_marks, existing_rows = _merge_with_disappeared(rows_empty, ws, headers, uc_to_task)
+        rows_empty, q_marks, existing_rows = _merge_with_disappeared(
+            rows_empty,
+            ws,
+            headers,
+            uc_to_task,
+            blocked_task_ids=blocked_task_ids_full,
+        )
         if rows_empty:
             write_all_rows(
                 ws,
@@ -1554,7 +2086,13 @@ def full_sync() -> None:
 
     # Detectar invoices que sumiram e preservar suas linhas
     rows_before = len(rows)
-    rows, q_marks, existing_rows = _merge_with_disappeared(rows, ws, headers, uc_to_task)
+    rows, q_marks, existing_rows = _merge_with_disappeared(
+        rows,
+        ws,
+        headers,
+        uc_to_task,
+        blocked_task_ids=blocked_task_ids_full,
+    )
 
     del uc_invoices, uc_to_task
     force_free_memory()
@@ -1566,9 +2104,9 @@ def full_sync() -> None:
 
     # Adicionar marcações Q para placeholders
     if placeholder_keys:
-        val_idx = headers.index("Validação")
-        uc_idx = headers.index("UC")
-        mes_idx = headers.index("Mês de Referencia")
+        val_idx = _header_index(headers, "Validação", "Validacao", "ValidaÃ§Ã£o")
+        uc_idx = _header_index(headers, "UC")
+        mes_idx = _header_index(headers, "Mês de Referencia", "Mes de Referencia", "MÃªs de Referencia")
         for i, row in enumerate(rows):
             uc = str(row[uc_idx]).strip() if len(row) > uc_idx else ""
             mes = str(row[mes_idx]).strip() if len(row) > mes_idx else ""
@@ -1613,10 +2151,37 @@ def delta_sync(last_updated_ts: int) -> int:
         date_updated_gt=last_updated_ts,
         transform=slim_task,
     )
+    tasks, blocked_black_count, blocked_black_ids = _filter_out_planejamento_black(tasks)
+    tasks, blocked_never_joined_count, blocked_never_joined_ids = _filter_out_never_joined_terminated(tasks)
 
     ws = get_worksheet()
     ensure_headers(ws)
     headers = get_headers()
+
+    if blocked_black_count:
+        logger.info(
+            "Delta ClickUp: %d tasks ignoradas por '%s'.",
+            blocked_black_count,
+            _STATUS_PLANEJAMENTO_BLACK_LABEL,
+        )
+        removed_black_rows = _remove_rows_by_task_ids(ws, headers, blocked_black_ids)
+        if removed_black_rows:
+            logger.info(
+                "Delta ClickUp: %d linhas removidas da planilha por '%s'.",
+                removed_black_rows,
+                _STATUS_PLANEJAMENTO_BLACK_LABEL,
+            )
+    if blocked_never_joined_count:
+        logger.info(
+            "Delta ClickUp: %d tasks ignoradas por status terminal sem início/fim de operação.",
+            blocked_never_joined_count,
+        )
+        removed_never_joined_rows = _remove_rows_by_task_ids(ws, headers, blocked_never_joined_ids)
+        if removed_never_joined_rows:
+            logger.info(
+                "Delta ClickUp: %d linhas removidas da planilha por status terminal sem início/fim de operação.",
+                removed_never_joined_rows,
+            )
 
     if not _known_task_ids:
         try:
@@ -1660,6 +2225,9 @@ def delta_sync(last_updated_ts: int) -> int:
     # comentario normalizado
     if POWERREV_BASE_URL:
         _delta_powerrev_check(ws, headers)
+
+    # Garantir consistencia caso UC/Mes mudem durante delta.
+    _recompute_mes_atendimento(ws, headers)
 
     del ws, headers
     log_sync_stats("DELTA SYNC")
@@ -1828,6 +2396,10 @@ def _interruptible_sleep(seconds: float) -> None:
 
 if __name__ == "__main__":
     main()
+
+
+
+
 
 
 

@@ -1,15 +1,15 @@
 """
-Mapeamento de campos ClickUp → colunas da planilha Faturamento.
+Mapeamento de campos ClickUp â†’ colunas da planilha Faturamento.
 
 Cada entrada:
-  key          – identificador interno
-  header       – nome da coluna no Google Sheets
-  source       – "custom_field" | "task_field" | "computed" | "placeholder"
-  cf_id        – UUID do custom field (quando source == "custom_field")
-  transform    – nome de função em transformers.py (opcional)
+  key          â€“ identificador interno
+  header       â€“ nome da coluna no Google Sheets
+  source       â€“ "custom_field" | "task_field" | "computed" | "placeholder"
+  cf_id        â€“ UUID do custom field (quando source == "custom_field")
+  transform    â€“ nome de funÃ§Ã£o em transformers.py (opcional)
 """
 
-# ── Campos que vêm do ClickUp ────────────────────────────
+# â”€â”€ Campos que vÃªm do ClickUp â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 FIELD_MAP = {
     "task_id": {
         "header": "Task ID",
@@ -39,11 +39,11 @@ FIELD_MAP = {
     },
     "envio_boleto": {
         "header": "Envio do boleto",
-        "source": "computed",  # dia_envio + mes_ref + lógica Mês Atual/Seguinte
+        "source": "computed",  # dia_envio + mes_ref + lÃ³gica Mês Atual/Seguinte
     },
     "data_vencimento": {
         "header": "Data de Vencimento",
-        "source": "computed",  # dia_vencto + mes_ref + lógica dia/razão social
+        "source": "computed",  # dia_vencto + mes_ref + lÃ³gica dia/razÃ£o social
     },
     "mes_atendimento": {
         "header": "Mês de atandimento",
@@ -104,7 +104,7 @@ FIELD_MAP = {
         "source": "placeholder",
     },
     "parentesco_agrupado": {
-        "header": "Parentesco agrupado",
+        "header": "Fim de Operação",
         "source": "placeholder",
     },
     "invoice_id": {
@@ -113,7 +113,7 @@ FIELD_MAP = {
     },
 }
 
-# ── Campos de data usados para expandir meses ────────────
+# â”€â”€ Campos de data usados para expandir meses â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 DATE_FIELDS = {
     "inicio_operacao": {
         "cf_id": "ebd051a1-d5b6-4cb1-861b-574a1f968663",
@@ -123,10 +123,13 @@ DATE_FIELDS = {
     },
 }
 
-# ── Campos auxiliares para cálculo de Envio/Vencimento ───
+# â”€â”€ Campos auxiliares para cÃ¡lculo de Envio/Vencimento â”€â”€â”€
 COMPUTATION_FIELDS = {
     "mes_envio_boleto": {
         "cf_id": "ed8813c6-d508-4e47-9298-926a7fcd928a",
+    },
+    "mes_vencimento_boleto": {
+        "cf_id": "dcaaa5d9-8d1a-435d-bf2b-50fa5488d480",
     },
     "dia_envio_boleto": {
         "cf_id": "838a8088-ce85-4564-90ee-ce243b229a29",
@@ -136,40 +139,33 @@ COMPUTATION_FIELDS = {
     },
 }
 
-# ── Campos de observações (3 CFs concatenados em "Observações ClickUp") ─
+# â”€â”€ Campos de observaÃ§Ãµes (3 CFs concatenados em "Observações ClickUp") â”€
 OBS_FIELDS = [
     {"label": "Plano", "cf_id": "48b2d7f1-d2e0-45b4-a58a-3f83686ea980"},
     {"label": "Gerais", "cf_id": "94ef8acf-865b-4bcc-b763-02ce2aa184a7"},
     {"label": "Contrato", "cf_id": "1271d921-116c-431e-9e82-0f75ba6f28cb"},
 ]
 
-# ── Razões sociais que sempre recebem +1 mês no vencimento
-RAZAO_SOCIAL_VENCTO_EXTRA = {
-    "DROGARIAS PACHECO S.A.",
-    "DROGARIAS SÃO PAULO",
-    "W V BEZERRA RESTAURANTE LTDA",
-}
-
-# ── Mapa estático de opções dos dropdowns (id → nome) ────
+# â”€â”€ Mapa estÃ¡tico de opÃ§Ãµes dos dropdowns (id â†’ nome) â”€â”€â”€â”€
 DROPDOWN_OPTIONS = {
     # Status Detalhado
     "1a5118f7-b9a0-466f-889d-37edd76bd304": {
         "12a08c0a-9e2b-4ed0-b40e-7313791840eb": "Ativo",
         "d322386d-2b63-43cb-8036-cae3cf94531f": "Retirado da Usina - Saldo",
-        "d8831b76-8f4d-4744-938b-82efef419437": "Retirado da Usina - Inadimplência",
+        "d8831b76-8f4d-4744-938b-82efef419437": "Retirado da Usina - InadimplÃªncia",
         "ae80bc03-d28f-4bc3-ae2f-653accd64e0b": "Aguardando Cadastro - Usina",
-        "92cb3240-3915-43ac-a9d9-517a8903b448": "A Retirar da Usina - Demissão",
+        "92cb3240-3915-43ac-a9d9-517a8903b448": "A Retirar da Usina - DemissÃ£o",
         "a74997a7-e393-4bfc-9241-ed76a0a05569": "Encerrado - Financeiro",
         "25a28dc4-16ff-4ecf-b94f-a7b3a6eef42c": "Encerrado - Troca de Plano",
-        "b39e4722-25c1-4bbb-980d-dc5d43789dc3": "Aguardando saída de concorrente",
+        "b39e4722-25c1-4bbb-980d-dc5d43789dc3": "Aguardando saÃ­da de concorrente",
         "15f1bd8a-215f-4869-9386-fb725a7b8adb": "Cadastro em andamento",
         "265047c8-7ca1-44ec-a627-c598aab081ba": "Baixo Consumo",
         "5afbfb3f-8c96-455d-8d87-164ed477ae52": "Retirado da Usina - CR",
-        "1c4aabb2-3fb0-4e2d-8a67-03025ac2654d": "Aguardando Cadastro - em Contingência",
-        "c4876bc8-67fd-4db1-8d3e-60a8995ee839": "Ativo - em Contingência",
+        "1c4aabb2-3fb0-4e2d-8a67-03025ac2654d": "Aguardando Cadastro - em ContingÃªncia",
+        "c4876bc8-67fd-4db1-8d3e-60a8995ee839": "Ativo - em ContingÃªncia",
         "6460b3b7-e6c7-484c-ac90-6a1f9d2d0ca0": "A Retirar da Usina - CR",
-        "32706ab8-e1c8-4052-ab94-3261c52acc72": "Retirado da Usina - Demissão",
-        "2e7e31aa-13c8-4a78-a550-3d8d8ea6bd5a": "A Retirar da Usina - Inadimplência",
+        "32706ab8-e1c8-4052-ab94-3261c52acc72": "Retirado da Usina - DemissÃ£o",
+        "2e7e31aa-13c8-4a78-a550-3d8d8ea6bd5a": "A Retirar da Usina - InadimplÃªncia",
         "2ff02b08-cd28-48b0-8ab4-b516ed8be73d": "Eliminado",
         "a2ff017f-77d1-403e-ba35-c375057144d0": "Excluido",
         "a858ffec-5fe1-44ac-84aa-da5ead59ce7b": "Demitido",
@@ -191,14 +187,14 @@ DROPDOWN_OPTIONS = {
         "d4e00593-30b8-423c-b3b6-c7a498d7d435": "CELESC",
         "c19855c6-d4a7-446a-92c9-9e00f213c143": "AmE",
     },
-    # Mês de envio do boleto
+    # MÃªs de envio do boleto
     "ed8813c6-d508-4e47-9298-926a7fcd928a": {
-        "1c745be3-0763-4396-b508-0de2d1189de3": "Mês Atual",
-        "16a8ada3-c5a1-484b-acd1-97f34e97f576": "Mês Seguinte",
+        "1c745be3-0763-4396-b508-0de2d1189de3": "Mesmo mês da emissão",
+        "16a8ada3-c5a1-484b-acd1-97f34e97f576": "Um mês após a emissão",
     },
 }
 
-# Ordem das colunas na planilha (define a posição de cada campo)
+# Ordem das colunas na planilha (define a posiÃ§Ã£o de cada campo)
 COLUMN_ORDER = [
     "task_id",
     "status",
@@ -228,3 +224,4 @@ COLUMN_ORDER = [
 def get_headers() -> list[str]:
     """Retorna lista de headers na ordem correta."""
     return [FIELD_MAP[k]["header"] for k in COLUMN_ORDER]
+
