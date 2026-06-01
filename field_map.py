@@ -99,6 +99,10 @@ FIELD_MAP = {
         "header": "Validação",
         "source": "placeholder",
     },
+    "inicio_operacao_display": {
+        "header": "Início de Operação",
+        "source": "placeholder",
+    },
     "observacoes": {
         "header": "Observações",
         "source": "placeholder",
@@ -209,15 +213,14 @@ COLUMN_ORDER = [
     "tipo_faturamento",
     "observacoes",          # coluna manual protegida
     "valor_boleto",         # valor PowerRev
-    "valor_final",          # coluna manual protegida
     "data_emissao_fatura",  # data emissao em O
-    "data_emissao_final",   # coluna manual protegida
     "status_faturamento",
     "provider_name",
     "observacoes_clickup",
     "validacao",
-    "parentesco_agrupado",  # coluna S
-    "invoice_id",           # coluna tecnica (oculta)
+    "inicio_operacao_display",  # coluna S
+    "parentesco_agrupado",      # coluna T
+    "invoice_id",               # coluna U (tecnica)
 ]
 
 

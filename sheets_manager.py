@@ -38,7 +38,7 @@ _CURRENCY_FORMAT_APPLIED: bool = False
 
 # Colunas protegidas (editaveis manualmente na planilha).
 # A restauracao usa chave primaria UC|Mes|InvoiceID e fallback UC|Mes.
-_PROTECTED_KEYS = {"observacoes", "valor_final", "data_emissao_final"}
+_PROTECTED_KEYS = {"observacoes"}
 _PROTECTED_COL_INDEXES = [i for i, key in enumerate(COLUMN_ORDER) if key in _PROTECTED_KEYS]
 _WRITABLE_COL_INDEXES = [i for i, key in enumerate(COLUMN_ORDER) if key not in _PROTECTED_KEYS]
 _INVOICE_ID_HEADER = "Invoice ID"
@@ -368,7 +368,7 @@ def _merge_saved_values(current: list[str] | None, candidate: list[str]) -> list
 
 
 def _build_protected_snapshot_from_rows(data_rows: list[list[str]]) -> dict[str, object]:
-    """Captura snapshot dos valores protegidos (L/N/P) por chaves primaria/fallback."""
+    """Captura snapshot dos valores protegidos por chaves primaria/fallback."""
     uc_col = COLUMN_ORDER.index("uc")
     mes_col = COLUMN_ORDER.index("mes_referencia")
     invoice_id_col = COLUMN_ORDER.index("invoice_id") if "invoice_id" in COLUMN_ORDER else None
@@ -453,7 +453,7 @@ def capture_protected_snapshot(
     ws: gspread.Worksheet,
     existing_data_rows: list[list[str]] | None = None,
 ) -> dict[str, object]:
-    """Lê e captura snapshot dos valores protegidos (L/N/P)."""
+    """Le e captura snapshot dos valores protegidos."""
     from stats import stats
 
     if existing_data_rows is None:
@@ -480,7 +480,7 @@ def get_worksheet() -> gspread.Worksheet:
         )
         stats.sheets_write_requests += 1
         logger.info("Aba '%s' criada.", SHEET_TAB_NAME)
-    # Nao altera estrutura de colunas automaticamente para nao arriscar layout/formatações.
+    # Nao altera estrutura de colunas automaticamente para nao arriscar layout/formatacoes.
     needed_cols = len(COLUMN_ORDER)
     if ws.col_count < needed_cols:
         logger.warning(
@@ -528,7 +528,7 @@ def read_all_rows(ws: gspread.Worksheet) -> list[list[str]]:
 
 
 def read_column_values(ws: gspread.Worksheet, col_idx: int) -> list[str]:
-    """Lê apenas uma coluna (0-based), retornando valores a partir da linha 2."""
+    """Le apenas uma coluna (0-based), retornando valores a partir da linha 2."""
     from stats import stats
     values = _retry(ws.col_values, col_idx + 1)
     stats.sheets_read_requests += 1
@@ -546,9 +546,9 @@ def write_all_rows(
     protected_snapshot: dict[str, object] | None = None,
 ) -> None:
     """
-    Reescreve toda a grade de valores (sem mexer em formatacao), projetando L/N/P por chave.
+    Reescreve toda a grade de valores (sem mexer em formatacao), projetando colunas protegidas por chave.
 
-    A projecao de L/N/P acontece ANTES da primeira escrita. Assim, cada linha escrita
+    A projecao das colunas protegidas acontece ANTES da primeira escrita. Assim, cada linha escrita
     ja sai consistente em um unico passo, reduzindo risco de vazamento de valores
     protegidos em caso de interrupcao no meio do full sync.
 
@@ -866,7 +866,7 @@ def update_columns_in_place(
         )
         raise RuntimeError(
             "Tentativa bloqueada de escrita em coluna protegida "
-            f"(L/N/P). Células: {sample}"
+            f"Celulas: {sample}"
         )
 
     chunk: list[dict] = []

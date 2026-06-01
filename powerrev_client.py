@@ -6,6 +6,7 @@ import time
 import logging
 import re
 from collections import OrderedDict
+from datetime import datetime, timedelta
 from typing import Any
 
 import requests
@@ -353,9 +354,9 @@ def _format_date(value: Any) -> str:
     if not text:
         return ""
     try:
-        from datetime import datetime
         candidate = text.replace("Z", "+00:00")
         dt = datetime.fromisoformat(candidate)
+        dt = dt - timedelta(hours=3)
         return dt.strftime("%d/%m/%Y")
     except (ValueError, TypeError):
         pass
@@ -659,7 +660,7 @@ def fetch_invoices_for_month(reference_month: str) -> list[dict]:
                 _safe_str(item.get("accountId")),
                 _safe_str(item.get("consumerUnits")),
                 raw_status,
-                _safe_str(item.get("issueDate")),
+                formatted_issue,
                 _safe_str(item.get("dueDate")),
                 _safe_str(item.get("total")),
             )
@@ -721,7 +722,7 @@ def fetch_invoices_for_month(reference_month: str) -> list[dict]:
                 uc,
                 mother_ref,
                 raw_status,
-                _safe_str(item.get("issueDate")),
+                formatted_issue,
                 _safe_str(item.get("dueDate")),
                 _safe_str(item.get("total")),
                 _safe_str(item.get("providerName")),

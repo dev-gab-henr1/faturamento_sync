@@ -257,6 +257,16 @@ def get_inicio_operacao(task: dict) -> datetime | None:
     return _parse_date(cf.get("value"))
 
 
+def get_inicio_operacao_display(task: dict | None) -> str:
+    """Retorna texto para coluna de inicio de operacao."""
+    if not task:
+        return "Sem data de inicio definida"
+    dt = get_inicio_operacao(task)
+    if dt is None:
+        return "Sem data de inicio definida"
+    return dt.strftime("%d/%m/%Y")
+
+
 def get_fim_operacao(task: dict) -> datetime | None:
     cf = _get_cf_value(task, DATE_FIELDS["fim_operacao"]["cf_id"])
     if cf is None:
@@ -396,6 +406,37 @@ def _build_observacoes(task: dict) -> str:
     return "\n".join(parts)
 
 
+def _to_sheet_money_value(value: object) -> object:
+    """
+    Normaliza valor monetário para escrita no Sheets.
+    Retorna float quando possível (para respeitar formatação de moeda da coluna),
+    string vazia quando nulo, e texto original se não for parseável.
+    """
+    if value is None:
+        return ""
+
+    text = str(value).strip()
+    if not text:
+        return ""
+
+    cleaned = re.sub(r"[^0-9,.\-]", "", text)
+    if not cleaned:
+        return ""
+
+    if "," in cleaned and "." in cleaned:
+        if cleaned.rfind(",") > cleaned.rfind("."):
+            cleaned = cleaned.replace(".", "").replace(",", ".")
+        else:
+            cleaned = cleaned.replace(",", "")
+    elif "," in cleaned:
+        cleaned = cleaned.replace(".", "").replace(",", ".")
+
+    try:
+        return float(cleaned)
+    except (TypeError, ValueError):
+        return text
+
+
 def build_row(
     task: dict | None,
     invoice: dict,
@@ -475,7 +516,9 @@ def build_row(
         elif key == "data_emissao_fatura":
             row.append(invoice.get("issueDate", ""))
         elif key == "valor_boleto":
-            row.append(invoice.get("total", ""))
+            row.append(_to_sheet_money_value(invoice.get("total")))
+        elif key == "inicio_operacao_display":
+            row.append(get_inicio_operacao_display(task))
         elif key == "parentesco_agrupado":
             row.append(get_fim_operacao_display(task))
         elif key == "invoice_id":
