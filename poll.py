@@ -54,6 +54,7 @@ from clickup_client import fetch_all_tasks, iter_team_tasks_with_uc, reset_sessi
 from row_expander import (
     slim_task,
     get_inicio_operacao,
+    get_inicio_operacao_display,
     get_fim_operacao,
     get_fim_operacao_display,
     compute_data_vencimento_for_task,
@@ -157,6 +158,27 @@ _MONTH_NUM_PT = {
     "jan.": 1, "fev.": 2, "mar.": 3, "abr.": 4,
     "mai.": 5, "jun.": 6, "jul.": 7, "ago.": 8,
     "set.": 9, "out.": 10, "nov.": 11, "dez.": 12,
+}
+
+_ISSUE_DATE_SETTER_STATUS_NORMS = {
+    "emitida",
+    "issued",
+    "reemitida",
+    "reissued",
+}
+_ISSUE_DATE_RETAIN_STATUS_NORMS = _ISSUE_DATE_SETTER_STATUS_NORMS | {
+    "paga",
+    "paid",
+    "vencida",
+    "overdue",
+    "paga externamente",
+    "externally paid",
+    "negociada",
+    "negotiated",
+    "cancelada",
+    "canceled",
+    "expirada",
+    "expired",
 }
 
 def _extract_task_id_from_link(link: str) -> str:
@@ -452,9 +474,11 @@ def _run_full_sync_until_success(
 
 _STATUS_TROCA_PLANO = "25a28dc4-16ff-4ecf-b94f-a7b3a6eef42c"
 _STATUS_PLANEJAMENTO_BLACK = "29e28b58-2922-49c9-a8d0-f2a83d398d0a"
+_STATUS_ENCERRADO_FINANCEIRO = "a74997a7-e393-4bfc-9241-ed76a0a05569"
 _STATUS_CF_ID = "1a5118f7-b9a0-466f-889d-37edd76bd304"
 _STATUS_TROCA_PLANO_LABEL = "Encerrado - Troca de Plano"
 _STATUS_PLANEJAMENTO_BLACK_LABEL = "Planejamento - Black"
+_STATUS_ENCERRADO_FINANCEIRO_LABEL = "Encerrado - Financeiro"
 _PLANEJAMENTO_LIST_ID = "901321549851"
 _NEVER_JOINED_STATUS_LABELS = (
     "Eliminado",
@@ -549,6 +573,14 @@ def _is_planejamento_black(task: dict) -> bool:
     )
 
 
+def _is_encerrado_financeiro(task: dict) -> bool:
+    return _status_matches(
+        task,
+        _STATUS_ENCERRADO_FINANCEIRO,
+        _STATUS_ENCERRADO_FINANCEIRO_LABEL,
+    )
+
+
 def _is_planejamento_black_text(value: str) -> bool:
     return _normalize_status_label(value) == _normalize_status_label(_STATUS_PLANEJAMENTO_BLACK_LABEL)
 
@@ -595,6 +627,8 @@ def _should_use_transition_resolution(task_list: list[dict]) -> bool:
     if len(task_list) <= 1:
         return False
     if any(_is_troca_plano(t) for t in task_list):
+        return True
+    if any(_is_encerrado_financeiro(t) for t in task_list):
         return True
     return any(_is_planejamento_list_task(t) for t in task_list)
 
@@ -1187,6 +1221,11 @@ def _delta_powerrev_check(ws, headers: list[str]) -> None:
                 match_idx = _pop_unique_unmatched(inv_secondary_map, row_secondary, consumed_invoices)
             if match_idx is None and invoice_id.startswith("SYN|"):
                 match_idx = _pop_unique_unmatched(inv_fallback_map, fallback, consumed_invoices)
+            # Caso clássico de recálculo manual: invoice antigo sumiu, entrou invoice novo
+            # no mesmo UC/mês. Só remapeia automaticamente quando a linha antiga já estava
+            # em "Erro no sistema", para evitar trocas indevidas em linhas saudáveis.
+            if match_idx is None and current_q == _ERRO_SISTEMA:
+                match_idx = _pop_unique_unmatched(inv_fallback_map, fallback, consumed_invoices)
         else:
             match_idx = _pop_unique_unmatched(inv_secondary_map, row_secondary, consumed_invoices)
             if match_idx is None:
@@ -1217,12 +1256,28 @@ def _delta_powerrev_check(ws, headers: list[str]) -> None:
 
         rows_matched += 1
         inv = all_invoices[match_idx]
+        next_status = inv.get("status") or ""
+        next_issue_date = inv.get("issueDate") or ""
+        next_invoice_id = str(inv.get("invoiceId") or "").strip()
+        current_issue_date = _get_row_cell_value(current_row, emissao_col)
+        same_invoice = bool(invoice_id and next_invoice_id and invoice_id == next_invoice_id)
+
+        if _is_issue_date_setter_status(next_status):
+            issue_for_display = next_issue_date or (current_issue_date if same_invoice else "")
+        elif _is_issue_date_retain_status(next_status):
+            if same_invoice:
+                issue_for_display = current_issue_date or next_issue_date
+            else:
+                issue_for_display = next_issue_date
+        else:
+            issue_for_display = ""
+
         proposed: dict[int, object] = {
             uc_col: str(inv.get("uc", "")).strip(),
             mes_col: yyyymm_to_label(str(inv.get("referenceMonth", "")).strip()),
-            status_fat_col: inv.get("status") or "",
-            emissao_col: inv.get("issueDate") or "",
-            valor_col: "" if inv.get("total") is None else inv.get("total"),
+            status_fat_col: next_status,
+            emissao_col: issue_for_display,
+            valor_col: _to_sheet_money_value(inv.get("total")),
             val_col: "",
         }
         if provider_col is not None:
@@ -1334,6 +1389,11 @@ def _delta_clickup_update(ws, headers: list[str], updated_tasks: list[dict]) -> 
     dist_col = _header_index(headers, "Distribuidora")
     tipo_col = _header_index(headers, "Tipo de faturamento")
     obs_col = _header_index(headers, "Observações ClickUp", "Observacoes ClickUp", "ObservaÃƒÂ§ÃƒÂµes ClickUp")
+    inicio_operacao_col = (
+        COLUMN_ORDER.index("inicio_operacao_display")
+        if "inicio_operacao_display" in COLUMN_ORDER
+        else None
+    )
     fim_operacao_col = COLUMN_ORDER.index("parentesco_agrupado") if "parentesco_agrupado" in COLUMN_ORDER else None
 
     clickup_cols = {
@@ -1366,6 +1426,8 @@ def _delta_clickup_update(ws, headers: list[str], updated_tasks: list[dict]) -> 
         # Observações: campo computed, precisa de lógica própria
         obs_val = _build_observacoes(task)
         base_values[obs_col] = obs_val  # sempre atualizar (pode limpar)
+        if inicio_operacao_col is not None:
+            base_values[inicio_operacao_col] = get_inicio_operacao_display(task)
         if fim_operacao_col is not None:
             base_values[fim_operacao_col] = get_fim_operacao_display(task)
 
@@ -1445,6 +1507,37 @@ def _normalize_money_compare(value: object) -> str:
         return cleaned
 
 
+def _to_sheet_money_value(value: object) -> object:
+    """
+    Normaliza valor monetário para escrita no Sheets.
+    Retorna float quando possível (mantendo formatação de moeda),
+    string vazia quando nulo, e texto original se não for parseável.
+    """
+    if value is None:
+        return ""
+
+    text = str(value).strip()
+    if not text:
+        return ""
+
+    cleaned = re.sub(r"[^0-9,.\-]", "", text)
+    if not cleaned:
+        return ""
+
+    if "," in cleaned and "." in cleaned:
+        if cleaned.rfind(",") > cleaned.rfind("."):
+            cleaned = cleaned.replace(".", "").replace(",", ".")
+        else:
+            cleaned = cleaned.replace(",", "")
+    elif "," in cleaned:
+        cleaned = cleaned.replace(".", "").replace(",", ".")
+
+    try:
+        return float(cleaned)
+    except (TypeError, ValueError):
+        return text
+
+
 def _get_row_cell_value(row: list[str], col_idx: int) -> str:
     if col_idx < 0 or len(row) <= col_idx:
         return ""
@@ -1454,6 +1547,14 @@ def _get_row_cell_value(row: list[str], col_idx: int) -> str:
 def _format_log_value(value: object) -> str:
     text = str(value or "").strip()
     return text if text else "[vazio]"
+
+
+def _is_issue_date_setter_status(status_value: str) -> bool:
+    return _normalize_status_label(status_value) in _ISSUE_DATE_SETTER_STATUS_NORMS
+
+
+def _is_issue_date_retain_status(status_value: str) -> bool:
+    return _normalize_status_label(status_value) in _ISSUE_DATE_RETAIN_STATUS_NORMS
 
 
 def _build_effective_updates(
@@ -1485,6 +1586,70 @@ def _build_effective_updates(
         diffs.append(f"{col_name}: {_format_log_value(old_text)} -> {_format_log_value(new_text)}")
 
     return effective, diffs
+
+
+def _apply_issue_date_display_policy(
+    rows: list[list[object]],
+    headers: list[str],
+    existing_rows: list[list[str]] | None = None,
+) -> int:
+    """
+    Política de Data de Emissão:
+      - só nasce em status Emitida/Reemitida;
+      - status pós-emissão preservam a data para a mesma fatura;
+      - status pré-emissão ficam sem data.
+    """
+    if not rows:
+        return 0
+
+    uc_idx = _header_index(headers, "UC")
+    mes_idx = _header_index(headers, "Mês de Referencia", "Mes de Referencia", "MÃªs de Referencia")
+    status_idx = _header_index(headers, "Status de faturamento")
+    emissao_idx = _header_index(headers, "Data de Emissão da fatura", "Data de Emissao da fatura", "Data de EmissÃ£o da fatura")
+    invoice_idx = _header_index(headers, "Invoice ID") if _has_header(headers, "Invoice ID") else None
+
+    def _row_key(row: list[object]) -> tuple[str, str, str]:
+        uc = _get_row_cell_value(row, uc_idx)
+        mes = _get_row_cell_value(row, mes_idx)
+        inv = _get_row_cell_value(row, invoice_idx) if invoice_idx is not None else ""
+        return uc, mes, inv
+
+    existing_issue_by_key: dict[tuple[str, str, str], str] = {}
+    for row in (existing_rows or []):
+        key = _row_key(row)
+        if not all(key):
+            continue
+        date_val = _get_row_cell_value(row, emissao_idx)
+        if date_val and key not in existing_issue_by_key:
+            existing_issue_by_key[key] = date_val
+
+    changed = 0
+    for row in rows:
+        status_val = _get_row_cell_value(row, status_idx)
+        current_issue = _get_row_cell_value(row, emissao_idx)
+        key = _row_key(row)
+        prev_issue = existing_issue_by_key.get(key, "")
+
+        # Nasce em Emitida/Reemitida.
+        if _is_issue_date_setter_status(status_val):
+            if not current_issue and prev_issue:
+                row[emissao_idx] = prev_issue
+                changed += 1
+            continue
+
+        # Pós-emissão: mantém data da mesma fatura (quando já existir).
+        if _is_issue_date_retain_status(status_val):
+            if prev_issue and current_issue != prev_issue:
+                row[emissao_idx] = prev_issue
+                changed += 1
+            continue
+
+        # Pré-emissão: sem data.
+        if current_issue:
+            row[emissao_idx] = ""
+            changed += 1
+
+    return changed
 
 
 def _emit_delta_change_logs(prefix: str, details: list[tuple[str, str]], summary_threshold: int = 3) -> None:
@@ -1604,8 +1769,16 @@ def _merge_with_disappeared(
     task_id_idx = _header_index(headers, "Task ID") if _has_header(headers, "Task ID") else None
     valor_idx = _header_index(headers, "Valor do boleto")
     obs_idx = _header_index(headers, "Observações", "Observacoes", "ObservaÃ§Ãµes")
-    val_final_idx = _header_index(headers, "Valor final")
-    emiss_final_idx = _header_index(headers, "Data de emissão final", "Data de emissao final", "Data de emissÃ£o final")
+    val_final_idx = (
+        _header_index(headers, "Valor final")
+        if _has_header(headers, "Valor final")
+        else None
+    )
+    emiss_final_idx = (
+        _header_index(headers, "Data de emissão final", "Data de emissao final", "Data de emissÃ£o final")
+        if _has_header(headers, "Data de emissão final", "Data de emissao final", "Data de emissÃ£o final")
+        else None
+    )
 
     invoice_idx = _header_index(headers, "Invoice ID") if _has_header(headers, "Invoice ID") else None
     provider_idx = _header_index(headers, "Provider") if _has_header(headers, "Provider") else None
@@ -1685,6 +1858,37 @@ def _merge_with_disappeared(
         new_mes = _row_value_local(row, mes_idx)
         if new_uc and new_mes:
             new_uc_mes_keys.add((new_uc, new_mes))
+
+    def _is_real_invoice_row(row: list[str]) -> bool:
+        status_txt = _row_value_local(row, status_fat_idx)
+        if _is_missing_distributor_status(status_txt):
+            return False
+        inv_txt = _row_value_local(row, invoice_idx)
+        if not inv_txt:
+            return False
+        return not inv_txt.startswith("SYN|")
+
+    def _merge_manual_text(current_text: str, incoming_text: str) -> str:
+        current = str(current_text or "").strip()
+        incoming = str(incoming_text or "").strip()
+        if not incoming:
+            return current
+        if not current:
+            return incoming
+        if incoming in current:
+            return current
+        if current in incoming:
+            return incoming
+        return f"{current}\n{incoming}"
+
+    new_real_invoice_rows_by_uc_mes: dict[tuple[str, str], list[int]] = defaultdict(list)
+    for idx, row in enumerate(new_rows):
+        uc_new = _row_value_local(row, uc_idx)
+        mes_new = _row_value_local(row, mes_idx)
+        if not uc_new or not mes_new:
+            continue
+        if _is_real_invoice_row(row):
+            new_real_invoice_rows_by_uc_mes[(uc_new, mes_new)].append(idx)
 
     def _is_within_uc_period(uc: str, yyyymm: str) -> bool:
         if not uc_to_tasks:
@@ -1780,6 +1984,8 @@ def _merge_with_disappeared(
     dropped_planejamento_black = 0
     dropped_blocked_task = 0
     dropped_redundant_placeholder = 0
+    dropped_replaced_error = 0
+    migrated_manual_values = 0
     blocked_task_ids = {str(tid).strip() for tid in (blocked_task_ids or set()) if str(tid).strip()}
 
     for row in existing:
@@ -1837,6 +2043,32 @@ def _merge_with_disappeared(
         if _row_value_local(row, val_idx) == _NAO_PROCESSADO and (uc, mes) in new_uc_mes_keys:
             dropped_redundant_placeholder += 1
             continue
+        # Se havia linha antiga em erro e já existe nova fatura real para o mesmo UC/mês,
+        # descarta a linha de erro e migra campos manuais para a linha nova.
+        if _row_value_local(row, val_idx) == _ERRO_SISTEMA:
+            replacement_candidates = new_real_invoice_rows_by_uc_mes.get((uc, mes), [])
+            if replacement_candidates:
+                target_row = new_rows[replacement_candidates[0]]
+                while len(target_row) < WRITE_COL_COUNT:
+                    target_row.append("")
+
+                old_obs = _row_value_local(row, obs_idx)
+                if old_obs:
+                    current_obs = _row_value_local(target_row, obs_idx)
+                    merged_obs = _merge_manual_text(current_obs, old_obs)
+                    if merged_obs != current_obs:
+                        target_row[obs_idx] = merged_obs
+                        migrated_manual_values += 1
+
+                manual_merge_indexes = [idx for idx in (val_final_idx, emiss_final_idx) if idx is not None]
+                for manual_idx in manual_merge_indexes:
+                    old_val = _row_value_local(row, manual_idx)
+                    if old_val and not _row_value_local(target_row, manual_idx):
+                        target_row[manual_idx] = old_val
+                        migrated_manual_values += 1
+
+                dropped_replaced_error += 1
+                continue
 
         yyyymm = label_to_yyyymm(mes)
 
@@ -1847,6 +2079,7 @@ def _merge_with_disappeared(
         preserved = [str(v) for v in row[:WRITE_COL_COUNT]]
         while len(preserved) < WRITE_COL_COUNT:
             preserved.append("")
+        preserved[valor_idx] = _to_sheet_money_value(_row_value_local(row, valor_idx))
         preserved[val_idx] = ""  # q_marks escreve o status de erro depois
         disappeared_by_uc.setdefault(uc, []).append(preserved)
         disappeared_row_ids.add(id(preserved))
@@ -1871,6 +2104,16 @@ def _merge_with_disappeared(
         logger.info(
             "Regra Placeholder (merge): removidas %d linhas antigas de 'Nao processado' substituidas por linha nova.",
             dropped_redundant_placeholder,
+        )
+    if dropped_replaced_error:
+        logger.info(
+            "Regra ErroSistema (merge): removidas %d linhas antigas de erro substituidas por fatura real no mesmo UC/mes.",
+            dropped_replaced_error,
+        )
+    if migrated_manual_values:
+        logger.info(
+            "Regra ErroSistema (merge): %d campos manuais migrados para a linha nova.",
+            migrated_manual_values,
         )
 
     if not disappeared_row_ids:
@@ -2062,6 +2305,9 @@ def full_sync() -> None:
             blocked_task_ids=blocked_task_ids_full,
         )
         if rows_empty:
+            issue_adjusted = _apply_issue_date_display_policy(rows_empty, headers, existing_rows)
+            if issue_adjusted:
+                logger.info("Politica Data Emissao: %d ajustes aplicados (full sem dados novos).", issue_adjusted)
             write_all_rows(
                 ws,
                 rows_empty,
@@ -2093,6 +2339,10 @@ def full_sync() -> None:
         uc_to_task,
         blocked_task_ids=blocked_task_ids_full,
     )
+
+    issue_adjusted = _apply_issue_date_display_policy(rows, headers, existing_rows)
+    if issue_adjusted:
+        logger.info("Politica Data Emissao: %d ajustes aplicados no full sync.", issue_adjusted)
 
     del uc_invoices, uc_to_task
     force_free_memory()
