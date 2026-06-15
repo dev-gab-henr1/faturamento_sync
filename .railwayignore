@@ -1,0 +1,21 @@
+# Envia para o Railway apenas o necessario do projeto faturamento_sync.
+# Tudo que nao estiver explicitamente liberado fica fora do deploy.
+*
+
+!.gitignore
+!.railwayignore
+!Procfile
+!README.md
+!requirements.txt
+
+!clickup_client.py
+!config.py
+!field_map.py
+!monitor.py
+!poll.py
+!powerrev_client.py
+!row_expander.py
+!sheets_manager.py
+!stats.py
+!transformers.py
+!download_powerrev_pdfs_from_sheet.py

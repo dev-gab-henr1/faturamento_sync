@@ -35,6 +35,9 @@ desktop.ini
 # Logs
 *.log
 
+# Local browser profile used by the Copel ANEEL bot
+.copel_browser_profile/
+
 # Monitor
 __pycache__/
 

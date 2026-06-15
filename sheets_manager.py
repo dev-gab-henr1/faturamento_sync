@@ -38,7 +38,7 @@ _CURRENCY_FORMAT_APPLIED: bool = False
 
 # Colunas protegidas (editaveis manualmente na planilha).
 # A restauracao usa chave primaria UC|Mes|InvoiceID e fallback UC|Mes.
-_PROTECTED_KEYS = {"observacoes"}
+_PROTECTED_KEYS = {"observacoes", "data_faturamento"}
 _PROTECTED_COL_INDEXES = [i for i, key in enumerate(COLUMN_ORDER) if key in _PROTECTED_KEYS]
 _WRITABLE_COL_INDEXES = [i for i, key in enumerate(COLUMN_ORDER) if key not in _PROTECTED_KEYS]
 _INVOICE_ID_HEADER = "Invoice ID"
