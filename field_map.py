@@ -68,8 +68,24 @@ FIELD_MAP = {
         "transform": "resolve_dropdown",
     },
     "observacoes_clickup": {
-        "header": "Observações ClickUp",
+        "header": "Observações Financeiras",
         "source": "computed",
+    },
+    "data_faturamento": {
+        "header": "Data de Faturamento",
+        "source": "placeholder",
+    },
+    "login_distribuidora": {
+        "header": "Login da Distribuidora",
+        "source": "custom_field",
+        "cf_id": "d6305b8c-e448-4009-83ef-6afb1047c566",
+        "missing_value": "Sem login na ClickUp",
+    },
+    "senha_distribuidora": {
+        "header": "Senha da Distribuidora",
+        "source": "custom_field",
+        "cf_id": "117b58c3-a31b-4967-9cb2-42706f1cf812",
+        "missing_value": "Sem senha na ClickUp",
     },
     "status_faturamento": {
         "header": "Status de faturamento",
@@ -143,11 +159,9 @@ COMPUTATION_FIELDS = {
     },
 }
 
-# â”€â”€ Campos de observaÃ§Ãµes (3 CFs concatenados em "Observações ClickUp") â”€
+# â”€â”€ Campo de observações financeiras do ClickUp â”€
 OBS_FIELDS = [
-    {"label": "Plano", "cf_id": "48b2d7f1-d2e0-45b4-a58a-3f83686ea980"},
-    {"label": "Gerais", "cf_id": "94ef8acf-865b-4bcc-b763-02ce2aa184a7"},
-    {"label": "Contrato", "cf_id": "1271d921-116c-431e-9e82-0f75ba6f28cb"},
+    {"label": "Financeiras", "cf_id": "dead0bd3-64a3-482d-99b0-994abc8440b1"},
 ]
 
 # â”€â”€ Mapa estÃ¡tico de opÃ§Ãµes dos dropdowns (id â†’ nome) â”€â”€â”€â”€
@@ -213,18 +227,20 @@ COLUMN_ORDER = [
     "tipo_faturamento",
     "observacoes",          # coluna manual protegida
     "valor_boleto",         # valor PowerRev
-    "data_emissao_fatura",  # data emissao em O
+    "data_emissao_fatura",
+    "data_faturamento",     # coluna manual protegida
+    "login_distribuidora",
+    "senha_distribuidora",
     "status_faturamento",
     "provider_name",
     "observacoes_clickup",
     "validacao",
-    "inicio_operacao_display",  # coluna S
-    "parentesco_agrupado",      # coluna T
-    "invoice_id",               # coluna U (tecnica)
+    "inicio_operacao_display",
+    "parentesco_agrupado",
+    "invoice_id",               # coluna tecnica
 ]
 
 
 def get_headers() -> list[str]:
     """Retorna lista de headers na ordem correta."""
     return [FIELD_MAP[k]["header"] for k in COLUMN_ORDER]
-

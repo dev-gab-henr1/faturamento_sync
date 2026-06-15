@@ -213,14 +213,15 @@ def _extract_field_value(task: dict, key: str) -> str:
     if source == "custom_field":
         cf = _get_cf_value(task, spec["cf_id"])
         if cf is None:
-            return ""
+            return spec.get("missing_value", "")
         transform_name = spec.get("transform")
         if transform_name and transform_name in TRANSFORMERS:
             return TRANSFORMERS[transform_name](cf)
         val = cf.get("value")
         if val is None:
-            return ""
-        return str(val)
+            return spec.get("missing_value", "")
+        text = str(val).strip()
+        return text if text else spec.get("missing_value", "")
 
     return ""
 
@@ -396,14 +397,11 @@ def label_to_yyyymm(label: str) -> str:
 
 
 def _build_observacoes(task: dict) -> str:
-    """Concatena os 3 campos de observações do ClickUp, só os populados."""
-    parts = []
-    for obs in OBS_FIELDS:
-        raw = _get_cf_raw(task, obs["cf_id"])
-        text = clean_description(raw) if raw else ""
-        if text:
-            parts.append(f"{obs['label']}: {text}")
-    return "\n".join(parts)
+    """Retorna somente o campo Observações Financeiras do ClickUp."""
+    if not OBS_FIELDS:
+        return ""
+    raw = _get_cf_raw(task, OBS_FIELDS[0]["cf_id"])
+    return clean_description(raw) if raw else ""
 
 
 def _to_sheet_money_value(value: object) -> object:

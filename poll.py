@@ -1388,7 +1388,16 @@ def _delta_clickup_update(ws, headers: list[str], updated_tasks: list[dict]) -> 
     plano_col = _header_index(headers, "Plano de Adesão", "Plano de Adesao", "Plano de AdesÃƒÂ£o")
     dist_col = _header_index(headers, "Distribuidora")
     tipo_col = _header_index(headers, "Tipo de faturamento")
-    obs_col = _header_index(headers, "Observações ClickUp", "Observacoes ClickUp", "ObservaÃƒÂ§ÃƒÂµes ClickUp")
+    obs_col = _header_index(
+        headers,
+        "Observações Financeiras",
+        "Observacoes Financeiras",
+        "Observações ClickUp",
+        "Observacoes ClickUp",
+        "ObservaÃƒÂ§ÃƒÂµes ClickUp",
+    )
+    login_col = _header_index(headers, "Login da Distribuidora")
+    senha_col = _header_index(headers, "Senha da Distribuidora")
     inicio_operacao_col = (
         COLUMN_ORDER.index("inicio_operacao_display")
         if "inicio_operacao_display" in COLUMN_ORDER
@@ -1403,6 +1412,8 @@ def _delta_clickup_update(ws, headers: list[str], updated_tasks: list[dict]) -> 
         "plano": plano_col,
         "distribuidora": dist_col,
         "tipo_faturamento": tipo_col,
+        "login_distribuidora": login_col,
+        "senha_distribuidora": senha_col,
     }
 
     updates: dict[int, dict[int, str]] = {}
@@ -1769,6 +1780,11 @@ def _merge_with_disappeared(
     task_id_idx = _header_index(headers, "Task ID") if _has_header(headers, "Task ID") else None
     valor_idx = _header_index(headers, "Valor do boleto")
     obs_idx = _header_index(headers, "Observações", "Observacoes", "ObservaÃ§Ãµes")
+    data_faturamento_idx = (
+        _header_index(headers, "Data de Faturamento")
+        if _has_header(headers, "Data de Faturamento")
+        else None
+    )
     val_final_idx = (
         _header_index(headers, "Valor final")
         if _has_header(headers, "Valor final")
@@ -2060,7 +2076,11 @@ def _merge_with_disappeared(
                         target_row[obs_idx] = merged_obs
                         migrated_manual_values += 1
 
-                manual_merge_indexes = [idx for idx in (val_final_idx, emiss_final_idx) if idx is not None]
+                manual_merge_indexes = [
+                    idx
+                    for idx in (data_faturamento_idx, val_final_idx, emiss_final_idx)
+                    if idx is not None
+                ]
                 for manual_idx in manual_merge_indexes:
                     old_val = _row_value_local(row, manual_idx)
                     if old_val and not _row_value_local(target_row, manual_idx):

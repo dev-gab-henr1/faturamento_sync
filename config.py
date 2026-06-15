@@ -24,7 +24,7 @@ SPREADSHEET_ID = os.getenv(
     "SPREADSHEET_ID",
     "1ea2_iw2_GCK1_p2qrIxL-y_EdCY78BreFi_HzuPkjsg",
 )
-SHEET_TAB_NAME = "Faturamento"
+SHEET_TAB_NAME = os.getenv("SHEET_TAB_NAME", "Faturamento")
 
 GOOGLE_CREDENTIALS_JSON = os.getenv("GOOGLE_CREDENTIALS_JSON", "")
 GOOGLE_CREDENTIALS_FILE = os.getenv("GOOGLE_CREDENTIALS_FILE", "credentials.json")
