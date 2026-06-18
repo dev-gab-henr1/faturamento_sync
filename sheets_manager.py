@@ -7,6 +7,7 @@ import time
 import logging
 import re
 from collections import deque
+from datetime import datetime, timedelta
 
 import gspread
 from google.oauth2.service_account import Credentials
@@ -367,6 +368,77 @@ def _merge_saved_values(current: list[str] | None, candidate: list[str]) -> list
     return out
 
 
+def _overlay_formatted_protected_values(
+    raw_rows: list[list[str]],
+    formatted_rows: list[list[str]],
+) -> list[list[str]]:
+    """Usa valores formatados apenas nas colunas protegidas.
+
+    As chaves de match continuam vindo da leitura bruta, mas colunas manuais
+    como Data de Faturamento precisam ser preservadas como texto visivel.
+    """
+    if not _PROTECTED_COL_INDEXES or not raw_rows:
+        return raw_rows
+
+    merged_rows: list[list[str]] = []
+    for row_idx, raw_row in enumerate(raw_rows):
+        row_out = list(raw_row)
+        formatted_row = formatted_rows[row_idx] if row_idx < len(formatted_rows) else []
+
+        for col_idx in _PROTECTED_COL_INDEXES:
+            if len(formatted_row) > col_idx:
+                while len(row_out) <= col_idx:
+                    row_out.append("")
+                raw_value = raw_row[col_idx] if len(raw_row) > col_idx else ""
+                row_out[col_idx] = _format_protected_cell_value(
+                    col_idx,
+                    raw_value,
+                    formatted_row[col_idx],
+                )
+
+        merged_rows.append(row_out)
+
+    return merged_rows
+
+
+def _format_protected_cell_value(col_idx: int, raw_value: object, formatted_value: object) -> str:
+    """Preserva coluna manual como texto, reparando serial de data quando seguro."""
+    text = str(formatted_value) if formatted_value is not None else ""
+    if COLUMN_ORDER[col_idx] != "data_faturamento":
+        return text
+
+    raw_text = str(raw_value).strip()
+    formatted_text = text.strip()
+    if not raw_text or not formatted_text:
+        return text
+
+    normalized_raw = raw_text[:-2] if raw_text.endswith(".0") else raw_text
+    normalized_formatted = formatted_text[:-2] if formatted_text.endswith(".0") else formatted_text
+    if normalized_raw != normalized_formatted:
+        return text
+
+    try:
+        serial = float(raw_text)
+    except (TypeError, ValueError):
+        return text
+
+    # Google Sheets usa serial de dias; restringe a faixa para evitar converter texto numerico comum.
+    if serial < 30000 or serial > 70000:
+        return text
+
+    date_value = datetime(1899, 12, 30) + timedelta(days=serial)
+    return date_value.strftime("%d/%m/%Y")
+
+
+def _read_formatted_data_rows(ws: gspread.Worksheet) -> list[list[str]]:
+    """Le a planilha como texto exibido pelo Google Sheets."""
+    from stats import stats
+
+    existing = _retry(ws.get_all_values, value_render_option="FORMATTED_VALUE")
+    stats.sheets_read_requests += 1
+    return existing[1:] if len(existing) > 1 else []
+
+
 def _build_protected_snapshot_from_rows(data_rows: list[list[str]]) -> dict[str, object]:
     """Captura snapshot dos valores protegidos por chaves primaria/fallback."""
     uc_col = COLUMN_ORDER.index("uc")
@@ -463,7 +535,9 @@ def capture_protected_snapshot(
     else:
         data_rows = existing_data_rows
 
-    return _build_protected_snapshot_from_rows(data_rows)
+    formatted_rows = _read_formatted_data_rows(ws)
+    snapshot_rows = _overlay_formatted_protected_values(data_rows, formatted_rows)
+    return _build_protected_snapshot_from_rows(snapshot_rows)
 
 
 def get_worksheet() -> gspread.Worksheet:
@@ -582,7 +656,9 @@ def write_all_rows(
     data_rows_count = len(data_rows)
 
     if protected_snapshot is None:
-        protected_snapshot = _build_protected_snapshot_from_rows(data_rows)
+        formatted_rows = _read_formatted_data_rows(ws)
+        snapshot_rows = _overlay_formatted_protected_values(data_rows, formatted_rows)
+        protected_snapshot = _build_protected_snapshot_from_rows(snapshot_rows)
 
     saved_primary = dict(protected_snapshot.get("primary", {}))
     saved_fallback = dict(protected_snapshot.get("fallback", {}))
