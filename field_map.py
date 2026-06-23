@@ -192,6 +192,8 @@ DROPDOWN_OPTIONS = {
         "633b62b9-1c73-4de6-bab3-c78410ac80c5": "A Retirar da Usina - Black",
         "9d26bcc2-174b-487a-b7bb-46708b3ebf58": "Retirado da Usina - Black",
         "c5807601-bde8-4a50-8af7-4f5453dbfc74": "A Retirar da Usina - Saldo",
+        "d5c6593b-4cf8-4b70-aa28-2e38132e9d19": "Novo Cooperado",
+        "33d364f8-2838-40d5-a82e-70f96e8650c8": "Novo Cooperado - Em Contingência",
     },
     # Tipo de Faturamento
     "1b7083f4-36b2-4be8-bddd-c80001630359": {

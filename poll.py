@@ -475,11 +475,33 @@ def _run_full_sync_until_success(
 _STATUS_TROCA_PLANO = "25a28dc4-16ff-4ecf-b94f-a7b3a6eef42c"
 _STATUS_PLANEJAMENTO_BLACK = "29e28b58-2922-49c9-a8d0-f2a83d398d0a"
 _STATUS_ENCERRADO_FINANCEIRO = "a74997a7-e393-4bfc-9241-ed76a0a05569"
+_STATUS_AGUARDANDO_CADASTRO_USINA = "ae80bc03-d28f-4bc3-ae2f-653accd64e0b"
+_STATUS_AGUARDANDO_CADASTRO_CONTINGENCIA = "1c4aabb2-3fb0-4e2d-8a67-03025ac2654d"
+_STATUS_NOVO_COOPERADO = "d5c6593b-4cf8-4b70-aa28-2e38132e9d19"
+_STATUS_NOVO_COOPERADO_CONTINGENCIA = "33d364f8-2838-40d5-a82e-70f96e8650c8"
 _STATUS_CF_ID = "1a5118f7-b9a0-466f-889d-37edd76bd304"
 _STATUS_TROCA_PLANO_LABEL = "Encerrado - Troca de Plano"
 _STATUS_PLANEJAMENTO_BLACK_LABEL = "Planejamento - Black"
 _STATUS_ENCERRADO_FINANCEIRO_LABEL = "Encerrado - Financeiro"
+_STATUS_AGUARDANDO_CADASTRO_USINA_LABEL = "Aguardando Cadastro - Usina"
+_STATUS_AGUARDANDO_CADASTRO_CONTINGENCIA_LABEL = "Aguardando Cadastro - em Contingência"
+_STATUS_NOVO_COOPERADO_LABEL = "Novo Cooperado"
+_STATUS_NOVO_COOPERADO_CONTINGENCIA_LABEL = "Novo Cooperado - Em Contingência"
 _PLANEJAMENTO_LIST_ID = "901321549851"
+_BLOCKED_STATUS_LABEL = "status bloqueado para faturamento"
+_BLOCKED_STATUS_DEFINITIONS = (
+    (_STATUS_PLANEJAMENTO_BLACK, _STATUS_PLANEJAMENTO_BLACK_LABEL),
+    (_STATUS_AGUARDANDO_CADASTRO_USINA, _STATUS_AGUARDANDO_CADASTRO_USINA_LABEL),
+    (_STATUS_AGUARDANDO_CADASTRO_CONTINGENCIA, _STATUS_AGUARDANDO_CADASTRO_CONTINGENCIA_LABEL),
+    (_STATUS_NOVO_COOPERADO, _STATUS_NOVO_COOPERADO_LABEL),
+    (_STATUS_NOVO_COOPERADO_CONTINGENCIA, _STATUS_NOVO_COOPERADO_CONTINGENCIA_LABEL),
+)
+_BLOCKED_STATUS_TEXT_NORMALIZED_ALIASES = (
+    "aguardando cadastro em contingaancia",
+    "aguardando cadastro em conting?ncia",
+    "novo cooperado em contingaancia",
+    "novo cooperado em conting?ncia",
+)
 _NEVER_JOINED_STATUS_LABELS = (
     "Eliminado",
     "Excluido",
@@ -573,6 +595,10 @@ def _is_planejamento_black(task: dict) -> bool:
     )
 
 
+def _is_blocked_status(task: dict) -> bool:
+    return any(_status_matches(task, status_id, label) for status_id, label in _BLOCKED_STATUS_DEFINITIONS)
+
+
 def _is_encerrado_financeiro(task: dict) -> bool:
     return _status_matches(
         task,
@@ -581,8 +607,11 @@ def _is_encerrado_financeiro(task: dict) -> bool:
     )
 
 
-def _is_planejamento_black_text(value: str) -> bool:
-    return _normalize_status_label(value) == _normalize_status_label(_STATUS_PLANEJAMENTO_BLACK_LABEL)
+def _is_blocked_status_text(value: str) -> bool:
+    normalized = _normalize_status_label(value)
+    blocked_labels = {_normalize_status_label(label) for _, label in _BLOCKED_STATUS_DEFINITIONS}
+    blocked_labels.update(_BLOCKED_STATUS_TEXT_NORMALIZED_ALIASES)
+    return normalized in blocked_labels
 
 
 def _task_list_id(task: dict) -> str:
@@ -658,11 +687,16 @@ def _filter_out_never_joined_terminated(tasks: list[dict]) -> tuple[list[dict], 
 
 
 def _filter_out_planejamento_black(tasks: list[dict]) -> tuple[list[dict], int, set[str]]:
+    """Remove status que nao devem entrar no faturamento.
+
+    Nome mantido por compatibilidade interna; hoje inclui Planejamento - Black
+    e status iniciais de cadastro/novo cooperado.
+    """
     filtered: list[dict] = []
     blocked = 0
     blocked_ids: set[str] = set()
     for t in tasks:
-        if _is_planejamento_black(t):
+        if _is_blocked_status(t):
             blocked += 1
             tid = str(t.get("id", "")).strip()
             if tid:
@@ -2016,8 +2050,8 @@ def _merge_with_disappeared(
         if not uc or not mes:
             continue
 
-        # Não preservar linhas legadas com Status Detalhado = Planejamento - Black.
-        if _is_planejamento_black_text(_row_value_local(row, status_det_idx)):
+        # Não preservar linhas legadas com status bloqueado para faturamento.
+        if _is_blocked_status_text(_row_value_local(row, status_det_idx)):
             dropped_planejamento_black += 1
             continue
 
@@ -2111,9 +2145,9 @@ def _merge_with_disappeared(
         )
     if dropped_planejamento_black:
         logger.info(
-            "Regra Status (merge): removidas %d linhas antigas de '%s'.",
+            "Regra Status (merge): removidas %d linhas antigas por %s.",
             dropped_planejamento_black,
-            _STATUS_PLANEJAMENTO_BLACK_LABEL,
+            _BLOCKED_STATUS_LABEL,
         )
     if dropped_blocked_task:
         logger.info(
@@ -2189,9 +2223,9 @@ def full_sync() -> None:
     logger.info("Total tasks recebidas: %d", len(tasks))
     if blocked_black_count:
         logger.info(
-            "Filtro Status Detalhado: %d tasks ignoradas por '%s'.",
+            "Filtro Status Detalhado: %d tasks ignoradas por %s.",
             blocked_black_count,
-            _STATUS_PLANEJAMENTO_BLACK_LABEL,
+            _BLOCKED_STATUS_LABEL,
         )
     if blocked_never_joined_count:
         logger.info(
@@ -2227,7 +2261,7 @@ def full_sync() -> None:
         task_list_id = t.get("list", {}).get("id", "")
         if task_list_id not in allowed_lists:
             continue
-        if _is_planejamento_black(t):
+        if _is_blocked_status(t):
             fallback_blocked_black_count += 1
             tid = str(t.get("id", "")).strip()
             if tid:
@@ -2263,9 +2297,9 @@ def full_sync() -> None:
         logger.info("Fallback ClickUp: %d tasks extras recuperadas do workspace.", fallback_count)
     if fallback_blocked_black_count:
         logger.info(
-            "Fallback ClickUp: %d tasks ignoradas por '%s'.",
+            "Fallback ClickUp: %d tasks ignoradas por %s.",
             fallback_blocked_black_count,
-            _STATUS_PLANEJAMENTO_BLACK_LABEL,
+            _BLOCKED_STATUS_LABEL,
         )
     if fallback_blocked_never_joined_count:
         logger.info(
@@ -2430,16 +2464,16 @@ def delta_sync(last_updated_ts: int) -> int:
 
     if blocked_black_count:
         logger.info(
-            "Delta ClickUp: %d tasks ignoradas por '%s'.",
+            "Delta ClickUp: %d tasks ignoradas por %s.",
             blocked_black_count,
-            _STATUS_PLANEJAMENTO_BLACK_LABEL,
+            _BLOCKED_STATUS_LABEL,
         )
         removed_black_rows = _remove_rows_by_task_ids(ws, headers, blocked_black_ids)
         if removed_black_rows:
             logger.info(
-                "Delta ClickUp: %d linhas removidas da planilha por '%s'.",
+                "Delta ClickUp: %d linhas removidas da planilha por %s.",
                 removed_black_rows,
-                _STATUS_PLANEJAMENTO_BLACK_LABEL,
+                _BLOCKED_STATUS_LABEL,
             )
     if blocked_never_joined_count:
         logger.info(
