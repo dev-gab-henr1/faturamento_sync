@@ -16,7 +16,6 @@ CLICKUP_TEAM_ID = os.getenv("CLICKUP_TEAM_ID", "9013290037")
 CLICKUP_LIST_IDS = [
     "901322296001",
     "901321549851",
-    "901324691177",
 ]
 
 # ── Google Sheets ────────────────────────────────────────
