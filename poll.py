@@ -24,6 +24,7 @@ import re
 import unicodedata
 from collections import defaultdict, deque
 from datetime import datetime, timedelta, timezone
+from typing import Iterable
 from zoneinfo import ZoneInfo
 from dateutil.tz import gettz
 
@@ -65,6 +66,7 @@ from row_expander import (
     label_to_yyyymm,
     _extract_field_value,
     _build_observacoes,
+    build_observacoes_cobranca,
     _resolve_dropdown_value,
 )
 from sheets_manager import (
@@ -96,6 +98,86 @@ logger = logging.getLogger("faturamento_sync")
 
 # comentario normalizado
 _shutdown_requested = False
+
+
+def _run_invoice_capture_mirror_safely(mode: str) -> None:
+    """Executa o espelho sem permitir impacto no ciclo de faturamento."""
+    from config import INVOICE_CAPTURE_MIRROR_ENABLED
+
+    if not INVOICE_CAPTURE_MIRROR_ENABLED:
+        return
+
+    try:
+        from invoice_capture_mirror import sync_invoice_capture_mirror
+
+        sync_invoice_capture_mirror(mode)  # type: ignore[arg-type]
+    except Exception:
+        logger.exception(
+            "Falha no espelho de captura (%s); faturamento permaneceu concluido.",
+            mode,
+        )
+
+
+def _run_billing_details_mirror_safely(mode: str) -> None:
+    """Executa o espelho de detalhes sem permitir impacto no faturamento."""
+    from config import BILLING_DETAILS_MIRROR_ENABLED
+
+    if not BILLING_DETAILS_MIRROR_ENABLED:
+        return
+
+    try:
+        from billing_details_mirror import sync_billing_details_mirror
+
+        # O modo e mantido na assinatura do hook para ficar alinhado ao outro
+        # espelho; a planilha de detalhes sempre reespelha a origem completa.
+        sync_billing_details_mirror(apply=True)
+    except Exception:
+        logger.exception(
+            "Falha no espelho de detalhes (%s); faturamento permaneceu concluido.",
+            mode,
+        )
+
+
+def _cache_invoice_capture_clickup_fields(
+    tasks: Iterable[dict],
+    *,
+    complete: bool = False,
+) -> None:
+    """Disponibiliza fallbacks ao espelho sem alterar colunas do faturamento."""
+    from config import INVOICE_CAPTURE_MIRROR_ENABLED
+
+    if not INVOICE_CAPTURE_MIRROR_ENABLED:
+        return
+    try:
+        from invoice_capture_mirror import cache_clickup_invoice_issue_days
+
+        cache_clickup_invoice_issue_days(tasks, complete=complete)
+    except Exception:
+        logger.warning(
+            "Falha ao preparar fallback ClickUp do espelho; faturamento nao foi afetado.",
+            exc_info=True,
+        )
+
+
+def _cache_billing_details_clickup_fields(
+    tasks: Iterable[dict],
+    *,
+    complete: bool = False,
+) -> None:
+    """Disponibiliza Produto ao espelho de detalhes sem chamadas extras."""
+    from config import BILLING_DETAILS_MIRROR_ENABLED
+
+    if not BILLING_DETAILS_MIRROR_ENABLED:
+        return
+    try:
+        from billing_details_mirror import cache_clickup_products
+
+        cache_clickup_products(tasks, complete=complete)
+    except Exception:
+        logger.warning(
+            "Falha ao preparar Produto ClickUp do espelho de detalhes; faturamento nao foi afetado.",
+            exc_info=True,
+        )
 
 
 def _handle_sigterm(signum, frame):
@@ -261,6 +343,21 @@ def _next_full_sync_timestamp(now_local: datetime | None = None) -> float:
     )
     if candidate <= now:
         candidate = candidate + timedelta(days=1)
+    return candidate.timestamp()
+
+
+def _next_weekly_billing_details_timestamp(now_local: datetime | None = None) -> float:
+    """Proximo sabado as 04:00 no timezone do sync."""
+    now = now_local or datetime.now(_FULL_SYNC_TZ)
+    days_until_saturday = (5 - now.weekday()) % 7
+    candidate = (now + timedelta(days=days_until_saturday)).replace(
+        hour=4,
+        minute=0,
+        second=0,
+        microsecond=0,
+    )
+    if candidate <= now:
+        candidate = candidate + timedelta(days=7)
     return candidate.timestamp()
 
 
@@ -471,6 +568,7 @@ def _run_full_sync_until_success(
         _interruptible_sleep(wait_s)
 
     return False
+
 
 _STATUS_TROCA_PLANO = "25a28dc4-16ff-4ecf-b94f-a7b3a6eef42c"
 _STATUS_PLANEJAMENTO_BLACK = "29e28b58-2922-49c9-a8d0-f2a83d398d0a"
@@ -1393,6 +1491,9 @@ def _delta_clickup_update(ws, headers: list[str], updated_tasks: list[dict]) -> 
     if not updated_tasks:
         return
 
+    _cache_invoice_capture_clickup_fields(updated_tasks)
+    _cache_billing_details_clickup_fields(updated_tasks)
+
     task_id_col = _header_index(headers, "Task ID")
     mes_ref_col = _header_index(headers, "Mês de Referencia", "Mes de Referencia", "MÃƒÂªs de Referencia")
     envio_col = _header_index(headers, "Envio do boleto")
@@ -1418,6 +1519,7 @@ def _delta_clickup_update(ws, headers: list[str], updated_tasks: list[dict]) -> 
     # Colunas ClickUp a atualizar
     status_col = _header_index(headers, "Status Detalhado")
     uc_col = _header_index(headers, "UC")
+    uc_aneel_col = _header_index(headers, "UC Aneel")
     razao_col = _header_index(headers, "Razão Social", "Razao Social", "RazÃƒÂ£o Social")
     plano_col = _header_index(headers, "Plano de Adesão", "Plano de Adesao", "Plano de AdesÃƒÂ£o")
     dist_col = _header_index(headers, "Distribuidora")
@@ -1429,6 +1531,12 @@ def _delta_clickup_update(ws, headers: list[str], updated_tasks: list[dict]) -> 
         "Observações ClickUp",
         "Observacoes ClickUp",
         "ObservaÃƒÂ§ÃƒÂµes ClickUp",
+    )
+    obs_cobranca_col = _header_index(
+        headers,
+        "Observações de Cobrança",
+        "Observacoes de Cobranca",
+        "ObservaÃƒÂ§ÃƒÂµes de CobranÃƒÂ§a",
     )
     login_col = _header_index(headers, "Login da Distribuidora")
     senha_col = _header_index(headers, "Senha da Distribuidora")
@@ -1442,6 +1550,7 @@ def _delta_clickup_update(ws, headers: list[str], updated_tasks: list[dict]) -> 
     clickup_cols = {
         "status": status_col,
         "uc": uc_col,
+        "uc_aneel": uc_aneel_col,
         "razao_social": razao_col,
         "plano": plano_col,
         "distribuidora": dist_col,
@@ -1483,6 +1592,7 @@ def _delta_clickup_update(ws, headers: list[str], updated_tasks: list[dict]) -> 
                 mes_label = mes_ref_by_row.get(sheet_row, "")
                 row_values[envio_col] = compute_envio_boleto_for_task(task, mes_label)
                 row_values[data_venc_col] = compute_data_vencimento_for_task(task, mes_label)
+                row_values[obs_cobranca_col] = build_observacoes_cobranca(task, mes_label)
 
                 current_row = row_by_sheet.get(sheet_row, [])
                 effective, diffs = _build_effective_updates(
@@ -2318,6 +2428,22 @@ def full_sync() -> None:
         logger.info("UCs com múltiplos cards (troca de plano): %d", multi_uc_count)
 
     logger.info("UCs mapeadas total: %d", len(uc_to_task))
+    _cache_invoice_capture_clickup_fields(
+        (
+            task
+            for task_list in uc_to_task.values()
+            for task in task_list
+        ),
+        complete=True,
+    )
+    _cache_billing_details_clickup_fields(
+        (
+            task
+            for task_list in uc_to_task.values()
+            for task in task_list
+        ),
+        complete=True,
+    )
 
     # 4. Determinar range de meses
     start_ym, end_ym = _get_powerrev_date_range(tasks)
@@ -2424,10 +2550,10 @@ def full_sync() -> None:
     )
     _refresh_distributed_lock_if_needed(force=True)
 
-    # Aplicar marcações na coluna Q (Validação)
+    # Aplicar marcações na coluna de Validação.
     if q_marks:
         update_columns_in_place(ws, q_marks)
-        logger.info("Marcações Q aplicadas: %d", len(q_marks))
+        logger.info("Marcações de Validação aplicadas: %d", len(q_marks))
 
     elapsed = time.time() - t0
     logger.info(
@@ -2557,7 +2683,28 @@ def _reset_all_sessions(reason: str = "") -> None:
 def main() -> None:
     global _shutdown_requested
 
+    from config import (
+        BILLING_DETAILS_MIRROR_ENABLED,
+        BILLING_DETAILS_MIRROR_SHEET_TAB_NAME,
+        BILLING_DETAILS_MIRROR_SPREADSHEET_ID,
+        INVOICE_CAPTURE_MIRROR_ENABLED,
+        INVOICE_CAPTURE_SHEET_TAB_NAME,
+        INVOICE_CAPTURE_SPREADSHEET_ID,
+    )
+
     logger.info("Faturamento Sync iniciando (PID %d)...", os.getpid())
+    logger.info(
+        "Espelho de captura: %s (%s/%s).",
+        "habilitado" if INVOICE_CAPTURE_MIRROR_ENABLED else "desabilitado",
+        INVOICE_CAPTURE_SPREADSHEET_ID,
+        INVOICE_CAPTURE_SHEET_TAB_NAME,
+    )
+    logger.info(
+        "Espelho de detalhes: %s (%s/%s).",
+        "habilitado" if BILLING_DETAILS_MIRROR_ENABLED else "desabilitado",
+        BILLING_DETAILS_MIRROR_SPREADSHEET_ID,
+        BILLING_DETAILS_MIRROR_SHEET_TAB_NAME,
+    )
     log_memory("Boot")
 
     try:
@@ -2593,9 +2740,16 @@ def main() -> None:
     ):
         logger.info("Shutdown durante retries do full inicial.")
         return
+    _run_invoice_capture_mirror_safely("full")
+    _run_billing_details_mirror_safely("full")
 
     next_full_ts = _next_full_sync_timestamp()
     logger.info("Proximo full diario agendado para %s.", _format_local_dt(next_full_ts))
+    next_billing_details_ts = _next_weekly_billing_details_timestamp()
+    logger.info(
+        "Proximo espelho de detalhes agendado para %s.",
+        _format_local_dt(next_billing_details_ts),
+    )
 
     last_delta_ts = int(time.time() * 1000)
     consecutive_errors = 0
@@ -2630,13 +2784,30 @@ def main() -> None:
                 if not ok:
                     break
 
+                _run_invoice_capture_mirror_safely("full")
+
                 next_full_ts = _next_full_sync_timestamp()
                 logger.info("Proximo full diario agendado para %s.", _format_local_dt(next_full_ts))
                 last_delta_ts = int(time.time() * 1000)
                 consecutive_errors = 0
                 continue
 
+            if now >= next_billing_details_ts:
+                logger.info(
+                    "Janela do espelho de detalhes atingida (%s).",
+                    _format_local_dt(now),
+                )
+                _run_billing_details_mirror_safely("weekly")
+                next_billing_details_ts = _next_weekly_billing_details_timestamp()
+                logger.info(
+                    "Proximo espelho de detalhes agendado para %s.",
+                    _format_local_dt(next_billing_details_ts),
+                )
+                consecutive_errors = 0
+                continue
+
             last_delta_ts = delta_sync(last_delta_ts)
+            _run_invoice_capture_mirror_safely("delta")
             consecutive_errors = 0
 
         except KeyboardInterrupt:

@@ -23,7 +23,7 @@ from config import (
     SHEETS_RETRY_MAX_BACKOFF_S,
     get_google_credentials_info,
 )
-from field_map import get_headers, COLUMN_ORDER
+from field_map import get_headers, COLUMN_ORDER, FIELD_MAP
 
 logger = logging.getLogger(__name__)
 
@@ -39,7 +39,7 @@ _CURRENCY_FORMAT_APPLIED: bool = False
 
 # Colunas protegidas (editaveis manualmente na planilha).
 # A restauracao usa chave primaria UC|Mes|InvoiceID e fallback UC|Mes.
-_PROTECTED_KEYS = {"observacoes", "data_faturamento"}
+_PROTECTED_KEYS = {"observacoes", "data_faturamento", "captura_faturas"}
 _PROTECTED_COL_INDEXES = [i for i, key in enumerate(COLUMN_ORDER) if key in _PROTECTED_KEYS]
 _WRITABLE_COL_INDEXES = [i for i, key in enumerate(COLUMN_ORDER) if key not in _PROTECTED_KEYS]
 _INVOICE_ID_HEADER = "Invoice ID"
@@ -50,6 +50,13 @@ _CURRENCY_COL_FORMAT = {
         "pattern": "[$R$-416] #,##0.00",
     },
 }
+
+_LEGACY_COLUMN_ORDER_WITHOUT_UC_ANEEL = [
+    key for key in COLUMN_ORDER if key != "uc_aneel"
+]
+_LEGACY_HEADERS_WITHOUT_UC_ANEEL = [
+    FIELD_MAP[key]["header"] for key in _LEGACY_COLUMN_ORDER_WITHOUT_UC_ANEEL
+]
 
 # Mantido para compatibilidade com poll.py (_merge_with_disappeared).
 WRITE_COL_COUNT = len(COLUMN_ORDER)
@@ -200,7 +207,7 @@ def _col_letter(col_idx: int) -> str:
 
 
 def _ensure_currency_column_format(ws: gspread.Worksheet) -> None:
-    """Garante formato de moeda para a coluna de valor do boleto (M)."""
+    """Garante formato de moeda para a coluna de valor do boleto."""
     global _CURRENCY_FORMAT_APPLIED
     if _CURRENCY_FORMAT_APPLIED or _CURRENCY_COL_INDEX is None:
         return
@@ -574,6 +581,25 @@ def ensure_headers(ws: gspread.Worksheet) -> None:
     headers = get_headers()
     existing = _retry(ws.row_values, 1)
     stats.sheets_read_requests += 1
+
+    # Migração única e não destrutiva do layout anterior: insere fisicamente D
+    # para deslocar todas as colunas existentes, inclusive as manuais e Invoice ID.
+    if existing == _LEGACY_HEADERS_WITHOUT_UC_ANEEL:
+        _retry(
+            ws.insert_cols,
+            [[FIELD_MAP["uc_aneel"]["header"]]],
+            col=COLUMN_ORDER.index("uc_aneel") + 1,
+            value_input_option="RAW",
+            is_write=True,
+        )
+        stats.sheets_write_requests += 1
+        stats.sheets_cells_written += 1
+        existing = headers
+        logger.info(
+            "Migração de schema concluída: coluna 'UC Aneel' inserida em D; "
+            "dados existentes foram deslocados sem sobrescrita."
+        )
+
     if existing != headers:
         _retry(
             ws.update,
@@ -981,4 +1007,3 @@ def update_columns_in_place(
         stats.sheets_cells_written += len(chunk)
 
     logger.info("Columns update: %d celulas em %d linhas", total_cells, len(updates))
-

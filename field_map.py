@@ -28,6 +28,11 @@ FIELD_MAP = {
         "source": "custom_field",
         "cf_id": "abb7e1e9-3c99-4044-b20c-5eb19575a6d5",
     },
+    "uc_aneel": {
+        "header": "UC Aneel",
+        "source": "custom_field",
+        "cf_id": "cd8687a7-0393-45b9-8292-f9b878b31512",
+    },
     "razao_social": {
         "header": "Razão Social",
         "source": "custom_field",
@@ -91,6 +96,10 @@ FIELD_MAP = {
         "header": "Status de faturamento",
         "source": "placeholder",
     },
+    "captura_faturas": {
+        "header": "Captura de Faturas",
+        "source": "placeholder",
+    },
     "provider_name": {
         "header": "Provider",
         "source": "placeholder",
@@ -123,6 +132,10 @@ FIELD_MAP = {
         "header": "Observações",
         "source": "placeholder",
     },
+    "observacoes_cobranca": {
+        "header": "Observações de Cobrança",
+        "source": "computed",
+    },
     "parentesco_agrupado": {
         "header": "Fim de Operação",
         "source": "placeholder",
@@ -145,6 +158,9 @@ DATE_FIELDS = {
 
 # â”€â”€ Campos auxiliares para cÃ¡lculo de Envio/Vencimento â”€â”€â”€
 COMPUTATION_FIELDS = {
+    "invoice_issue_day": {
+        "cf_id": "c4f18991-f556-4019-af84-157c55aada63",
+    },
     "mes_envio_boleto": {
         "cf_id": "ed8813c6-d508-4e47-9298-926a7fcd928a",
     },
@@ -163,6 +179,9 @@ COMPUTATION_FIELDS = {
 OBS_FIELDS = [
     {"label": "Financeiras", "cf_id": "dead0bd3-64a3-482d-99b0-994abc8440b1"},
 ]
+BILLING_OBSERVATIONS_FIELD = {
+    "cf_id": "daae1721-fdd9-4a47-8fb9-39ecbeceb178",
+}
 
 # â”€â”€ Mapa estÃ¡tico de opÃ§Ãµes dos dropdowns (id â†’ nome) â”€â”€â”€â”€
 DROPDOWN_OPTIONS = {
@@ -219,6 +238,7 @@ COLUMN_ORDER = [
     "task_id",
     "status",
     "uc",
+    "uc_aneel",
     "razao_social",
     "mes_referencia",
     "envio_boleto",
@@ -234,8 +254,10 @@ COLUMN_ORDER = [
     "login_distribuidora",
     "senha_distribuidora",
     "status_faturamento",
+    "captura_faturas",
     "provider_name",
     "observacoes_clickup",
+    "observacoes_cobranca",
     "validacao",
     "inicio_operacao_display",
     "parentesco_agrupado",
