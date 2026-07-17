@@ -25,6 +25,51 @@ SPREADSHEET_ID = os.getenv(
 )
 SHEET_TAB_NAME = os.getenv("SHEET_TAB_NAME", "Faturamento")
 
+# Espelho de captura de faturas. A origem continua sendo a planilha acima e
+# nunca e escrita pelo modulo de espelhamento.
+_INVOICE_CAPTURE_MIRROR_ENABLED_RAW = os.getenv(
+    "INVOICE_CAPTURE_MIRROR_ENABLED",
+    "1",
+).strip().lower()
+INVOICE_CAPTURE_MIRROR_ENABLED = _INVOICE_CAPTURE_MIRROR_ENABLED_RAW in {
+    "1", "true", "yes", "y", "on",
+}
+INVOICE_CAPTURE_SOURCE_SHEET_TAB_NAME = "Faturamento"
+INVOICE_CAPTURE_SPREADSHEET_ID = os.getenv(
+    "INVOICE_CAPTURE_SPREADSHEET_ID",
+    "1Ehe5ef63fbnlWWA8iVT-Rf5ri1qJn3ERvS0AKKXf7Dc",
+).strip()
+INVOICE_CAPTURE_SHEET_TAB_NAME = os.getenv(
+    "INVOICE_CAPTURE_SHEET_TAB_NAME",
+    "Faturas",
+).strip() or "Faturas"
+INVOICE_CAPTURE_OBSERVATIONS_TAB_NAME = os.getenv(
+    "INVOICE_CAPTURE_OBSERVATIONS_TAB_NAME",
+    "__Faturas_Observacoes",
+).strip() or "__Faturas_Observacoes"
+
+# Espelho completo de detalhes de faturamento. Usa a aba Faturamento como
+# origem somente leitura e escreve em planilha separada.
+_BILLING_DETAILS_MIRROR_ENABLED_RAW = os.getenv(
+    "BILLING_DETAILS_MIRROR_ENABLED",
+    "1",
+).strip().lower()
+BILLING_DETAILS_MIRROR_ENABLED = _BILLING_DETAILS_MIRROR_ENABLED_RAW in {
+    "1", "true", "yes", "y", "on",
+}
+BILLING_DETAILS_MIRROR_SPREADSHEET_ID = os.getenv(
+    "BILLING_DETAILS_MIRROR_SPREADSHEET_ID",
+    "1OULXOPS-QvToCFizB2pjPS-ZyC6BRRRZ6TfU88nD12E",
+).strip()
+BILLING_DETAILS_MIRROR_SHEET_TAB_NAME = os.getenv(
+    "BILLING_DETAILS_MIRROR_SHEET_TAB_NAME",
+    "Teste",
+).strip() or "Teste"
+BILLING_DETAILS_MIRROR_CACHE_TAB_NAME = os.getenv(
+    "BILLING_DETAILS_MIRROR_CACHE_TAB_NAME",
+    "__Billing_Details_Cache",
+).strip() or "__Billing_Details_Cache"
+
 GOOGLE_CREDENTIALS_JSON = os.getenv("GOOGLE_CREDENTIALS_JSON", "")
 GOOGLE_CREDENTIALS_FILE = os.getenv("GOOGLE_CREDENTIALS_FILE", "credentials.json")
 

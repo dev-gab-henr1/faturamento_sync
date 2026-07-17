@@ -259,6 +259,20 @@ def _request(method: str, url: str, **kwargs) -> requests.Response:
     raise RuntimeError("Falha na requisição PowerRev.")
 
 
+def fetch_invoice_detail(invoice_id: str | int) -> dict:
+    """Busca o detalhe bruto de uma fatura pelo id."""
+    invoice_id_text = _safe_str(invoice_id)
+    if not invoice_id_text:
+        raise ValueError("invoice_id vazio")
+    resp = _request(
+        "GET",
+        f"{POWERREV_BASE_URL}/billing/invoice/{invoice_id_text}",
+    )
+    data = resp.json()
+    if not isinstance(data, dict):
+        raise RuntimeError(f"Detalhe da invoice {invoice_id_text} nao retornou objeto JSON.")
+    return data
+
 def _normalize_items(payload: Any) -> tuple[list[dict], int | None, int | None, int | None]:
     if isinstance(payload, list):
         return payload, None, None, None

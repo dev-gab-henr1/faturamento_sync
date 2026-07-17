@@ -4,12 +4,13 @@ PowerRev define quais linhas existem (uma por invoice).
 ClickUp enriquece com dados do cooperado.
 """
 from datetime import datetime
+import json
 import re
 import unicodedata
 from field_map import (
     FIELD_MAP, DATE_FIELDS, COLUMN_ORDER,
     COMPUTATION_FIELDS, DROPDOWN_OPTIONS,
-    OBS_FIELDS,
+    OBS_FIELDS, BILLING_OBSERVATIONS_FIELD,
 )
 from transformers import TRANSFORMERS, clean_description
 
@@ -20,6 +21,29 @@ _MONTH_ABBR_PT = {
 }
 
 _MONTH_NUM_PT = {v: k for k, v in _MONTH_ABBR_PT.items()}
+_MONTH_NAME_NUM_PT = {
+    "jan": 1, "janeiro": 1,
+    "fev": 2, "fevereiro": 2,
+    "mar": 3, "marco": 3,
+    "abr": 4, "abril": 4,
+    "mai": 5, "maio": 5,
+    "jun": 6, "junho": 6,
+    "jul": 7, "julho": 7,
+    "ago": 8, "agosto": 8,
+    "set": 9, "setembro": 9,
+    "out": 10, "outubro": 10,
+    "nov": 11, "novembro": 11,
+    "dez": 12, "dezembro": 12,
+}
+_BILLING_OBSERVATION_MARKER_RE = re.compile(
+    r"(?<!\w)"
+    r"(?:(?P<num>0?[1-9]|1[0-2])|"
+    r"(?P<name>jan(?:eiro)?|fev(?:ereiro)?|mar(?:[çc]o)?|abr(?:il)?|"
+    r"mai(?:o)?|jun(?:ho)?|jul(?:ho)?|ago(?:sto)?|set(?:embro)?|"
+    r"out(?:ubro)?|nov(?:embro)?|dez(?:embro)?))"
+    r"\.?\s*(?:[/\-.]|\s+de\s+|\s+)\s*(?P<year>20\d{2}|\d{2})(?!\d)",
+    re.IGNORECASE,
+)
 
 # Set de todos os cf_ids necessários (para slim)
 _NEEDED_CF_IDS: set[str] = set()
@@ -32,6 +56,11 @@ for spec in COMPUTATION_FIELDS.values():
     _NEEDED_CF_IDS.add(spec["cf_id"])
 for obs in OBS_FIELDS:
     _NEEDED_CF_IDS.add(obs["cf_id"])
+_NEEDED_CF_IDS.add(BILLING_OBSERVATIONS_FIELD["cf_id"])
+
+# Campo usado somente pelo espelho de detalhes de faturamento. Mantido no slim
+# para o poll.py conseguir alimentar o cache do espelho sem novas chamadas.
+_NEEDED_CF_IDS.add("62193781-2249-49c1-a95d-80df43d66971")
 
 # cf_ids de dropdowns que NÃO estão no mapa estático DROPDOWN_OPTIONS.
 # Apenas estes precisam de type_config para fallback no resolve_dropdown.
@@ -376,6 +405,12 @@ def extract_task_uc(task: dict) -> str:
     return str(val).strip() if val else ""
 
 
+def extract_task_invoice_issue_day(task: dict) -> str:
+    """Retorna o dia de emissao configurado no ClickUp para fallback do espelho."""
+    raw = _get_cf_raw(task, COMPUTATION_FIELDS["invoice_issue_day"]["cf_id"])
+    return str(raw or "").strip()
+
+
 def yyyymm_to_label(yyyymm: str) -> str:
     """'202503' → 'mar./2025'"""
     if len(yyyymm) < 6:
@@ -386,14 +421,49 @@ def yyyymm_to_label(yyyymm: str) -> str:
     return f"{abbr}/{year}" if abbr else ""
 
 
+def _normalize_month_text(value: str) -> str:
+    text = str(value or "").strip().lower().rstrip(".")
+    text = unicodedata.normalize("NFKD", text)
+    return "".join(ch for ch in text if not unicodedata.combining(ch))
+
+
+def _month_year_to_yyyymm(month_text: str, year_text: str) -> str:
+    month_token = _normalize_month_text(month_text)
+    if month_token.isdigit():
+        month = int(month_token)
+    else:
+        month = _MONTH_NAME_NUM_PT.get(month_token, 0)
+
+    if not 1 <= month <= 12:
+        return ""
+
+    year_raw = str(year_text or "").strip()
+    if len(year_raw) == 2 and year_raw.isdigit():
+        year = 2000 + int(year_raw)
+    elif len(year_raw) == 4 and year_raw.isdigit():
+        year = int(year_raw)
+    else:
+        return ""
+
+    return f"{year}{month:02d}"
+
+
 def label_to_yyyymm(label: str) -> str:
     """'mar./2025' → '202503'"""
+    text = str(label or "").strip()
     try:
-        abbr, year = label.split("/")
-        month_num = _MONTH_NUM_PT.get(abbr, 0)
-        return f"{year}{month_num:02d}"
+        abbr, year = text.split("/")
+        token = _month_year_to_yyyymm(abbr, year)
+        if token:
+            return token
     except (ValueError, IndexError):
+        pass
+
+    match = _BILLING_OBSERVATION_MARKER_RE.search(text)
+    if not match:
         return ""
+    month_text = match.group("num") or match.group("name") or ""
+    return _month_year_to_yyyymm(month_text, match.group("year"))
 
 
 def _build_observacoes(task: dict) -> str:
@@ -402,6 +472,84 @@ def _build_observacoes(task: dict) -> str:
         return ""
     raw = _get_cf_raw(task, OBS_FIELDS[0]["cf_id"])
     return clean_description(raw) if raw else ""
+
+
+def _clean_billing_observation_piece(value: str) -> str:
+    text = re.sub(r"\s+", " ", str(value or "")).strip()
+    text = re.sub(r"^[\s,:;\-–—]+", "", text)
+    text = re.sub(r"[\s,:;\-–—]+$", "", text)
+    return text.strip()
+
+
+def _clean_clickup_long_text(raw: object) -> str:
+    text = "" if raw is None else str(raw)
+    if not text or text == "None":
+        return ""
+
+    text_parts: list[str] = []
+    decoder = json.JSONDecoder()
+    pos = 0
+    parsed = False
+    while pos < len(text):
+        s = text[pos:].lstrip()
+        if not s:
+            break
+        try:
+            obj, end = decoder.raw_decode(s)
+        except json.JSONDecodeError:
+            break
+
+        if not isinstance(obj, dict) or not isinstance(obj.get("ops"), list):
+            return text.strip()
+
+        parsed = True
+        for op in obj.get("ops", []):
+            if not isinstance(op, dict):
+                continue
+            insert = op.get("insert", "")
+            if isinstance(insert, str):
+                text_parts.append(insert)
+        pos += (len(text[pos:]) - len(s)) + end
+
+    if not parsed:
+        return text.strip()
+    return "".join(text_parts).strip()
+
+
+def _parse_billing_observations_by_month(value: str) -> dict[str, list[str]]:
+    text = str(value or "").strip()
+    if not text:
+        return {}
+
+    matches = list(_BILLING_OBSERVATION_MARKER_RE.finditer(text))
+    by_month: dict[str, list[str]] = {}
+    for index, match in enumerate(matches):
+        month_text = match.group("num") or match.group("name") or ""
+        token = _month_year_to_yyyymm(month_text, match.group("year"))
+        if not token:
+            continue
+
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(text)
+        piece = _clean_billing_observation_piece(text[match.end():end])
+        if piece:
+            by_month.setdefault(token, []).append(piece)
+    return by_month
+
+
+def build_observacoes_cobranca(task: dict | None, mes_label: str) -> str:
+    if not task or not mes_label:
+        return ""
+
+    month_token = label_to_yyyymm(mes_label)
+    if not month_token:
+        return ""
+
+    raw = _get_cf_raw(task, BILLING_OBSERVATIONS_FIELD["cf_id"])
+    if not raw:
+        return ""
+
+    parsed = _parse_billing_observations_by_month(_clean_clickup_long_text(raw))
+    return ", ".join(parsed.get(month_token, []))
 
 
 def _to_sheet_money_value(value: object) -> object:
@@ -455,6 +603,7 @@ def build_row(
         for key in COLUMN_ORDER:
             base_values[key] = _extract_field_value(task, key)
         base_values["observacoes_clickup"] = _build_observacoes(task)
+        base_values["observacoes_cobranca"] = build_observacoes_cobranca(task, mes_label)
 
         dia_envio_raw = _get_cf_raw(task, COMPUTATION_FIELDS["dia_envio_boleto"]["cf_id"])
         dia_vencto_raw = _get_cf_raw(task, COMPUTATION_FIELDS["dia_vencto_boleto"]["cf_id"])
