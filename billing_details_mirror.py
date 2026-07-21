@@ -621,6 +621,25 @@ def _open_cache_worksheet(spreadsheet_id: str, *, create: bool):
         )
 
 
+def _ensure_worksheet_size(ws, *, rows: int, cols: int, label: str) -> None:
+    current_rows = int(getattr(ws, "row_count", 0) or 0)
+    current_cols = int(getattr(ws, "col_count", 0) or 0)
+    target_rows = max(current_rows, rows, 1)
+    target_cols = max(current_cols, cols, 1)
+    if target_rows == current_rows and target_cols == current_cols:
+        return
+
+    logger.info(
+        "Ajustando tamanho da aba %s: %dx%d -> %dx%d.",
+        label,
+        current_rows,
+        current_cols,
+        target_rows,
+        target_cols,
+    )
+    _retry(ws.resize, rows=target_rows, cols=target_cols, is_write=True)
+
+
 def _read_detail_cache(spreadsheet_id: str, *, create: bool = False) -> dict[str, PowerRevMetrics]:
     try:
         cache_ws = _open_cache_worksheet(spreadsheet_id, create=create)
@@ -650,6 +669,21 @@ def _write_detail_cache(
     cache: dict[str, PowerRevMetrics],
 ) -> None:
     cache_ws = _open_cache_worksheet(spreadsheet_id, create=True)
+    valid_items: list[tuple[str, PowerRevMetrics]] = []
+    invalid_count = 0
+    for invoice_id, metrics in cache.items():
+        invoice_id_text = str(invoice_id or "").strip()
+        if not _is_real_invoice_id(invoice_id_text):
+            invalid_count += 1
+            continue
+        valid_items.append((invoice_id_text, metrics))
+
+    if invalid_count:
+        logger.warning(
+            "Cache de detalhes PowerRev: %d invoice ids invalidos ignorados na gravacao.",
+            invalid_count,
+        )
+
     rows = [
         [
             invoice_id,
@@ -658,9 +692,15 @@ def _write_detail_cache(
             metrics.energia_compensada,
             metrics.reais_compensados,
         ]
-        for invoice_id, metrics in sorted(cache.items(), key=lambda item: int(item[0]))
+        for invoice_id, metrics in sorted(valid_items, key=lambda item: int(item[0]))
     ]
     output = [CACHE_HEADERS] + rows
+    _ensure_worksheet_size(
+        cache_ws,
+        rows=len(output),
+        cols=len(CACHE_HEADERS),
+        label=CACHE_SHEET_TAB_NAME,
+    )
     for offset in range(0, len(output), WRITE_CHUNK_SIZE):
         chunk = output[offset:offset + WRITE_CHUNK_SIZE]
         first = 1 + offset
@@ -759,8 +799,14 @@ def fetch_powerrev_details_with_cache(
                 metrics.reais_compensados,
             ]):
                 cache[invoice_id] = metrics
-        _write_detail_cache(spreadsheet_id, cache)
-        logger.info("Cache de detalhes PowerRev atualizado: %d invoices.", len(cache))
+        try:
+            _write_detail_cache(spreadsheet_id, cache)
+            logger.info("Cache de detalhes PowerRev atualizado: %d invoices.", len(cache))
+        except Exception:
+            logger.exception(
+                "Falha ao atualizar cache de detalhes PowerRev; "
+                "espelho continua usando os detalhes recuperados em memoria."
+            )
 
     return resolved
 
@@ -815,6 +861,12 @@ def write_target_rows(spreadsheet_id: str, tab_name: str, rows: list[list[str]])
     )
     previous_row_count = max(len(previous_values), 1)
     output = [HEADERS] + rows
+    _ensure_worksheet_size(
+        target_ws,
+        rows=len(output),
+        cols=len(HEADERS),
+        label=tab_name,
+    )
 
     for offset in range(0, len(output), WRITE_CHUNK_SIZE):
         chunk = output[offset:offset + WRITE_CHUNK_SIZE]
