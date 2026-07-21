@@ -2741,7 +2741,6 @@ def main() -> None:
         logger.info("Shutdown durante retries do full inicial.")
         return
     _run_invoice_capture_mirror_safely("full")
-    _run_billing_details_mirror_safely("full")
 
     next_full_ts = _next_full_sync_timestamp()
     logger.info("Proximo full diario agendado para %s.", _format_local_dt(next_full_ts))

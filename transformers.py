@@ -59,13 +59,18 @@ def clean_description(raw: str) -> str:
             break
         try:
             obj, end = decoder.raw_decode(s)
+            ops = obj.get("ops") if isinstance(obj, dict) else None
+            if not isinstance(ops, list):
+                return raw.strip()
             parsed = True
-            for op in obj.get("ops", []):
+            for op in ops:
+                if not isinstance(op, dict):
+                    continue
                 insert = op.get("insert", "")
                 if isinstance(insert, str):
                     text_parts.append(insert)
             pos += (len(raw[pos:]) - len(s)) + end
-        except (json.JSONDecodeError, AttributeError):
+        except json.JSONDecodeError:
             break
     if not parsed:
         # Não é JSON — retornar como texto direto
