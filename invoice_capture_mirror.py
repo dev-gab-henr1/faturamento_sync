@@ -330,6 +330,170 @@ def _normalize_uc_key(value: object) -> str:
     return unicodedata.normalize("NFKC", text).strip().lower()
 
 
+def _normal_invoice_id(invoice: dict) -> int:
+    raw = _text(
+        invoice.get("invoiceId") or invoice.get("idFaturaConsumo") or invoice.get("id")
+    ).strip()
+    try:
+        return int(raw)
+    except ValueError:
+        digits = "".join(ch for ch in raw if ch.isdigit())
+        return int(digits) if digits else 0
+
+
+def _normal_invoice_rank(invoice: dict) -> tuple[tuple[int, int, int, int, int, int], int]:
+    return _issue_date_rank(_normal_invoice_issue_date(invoice)), _normal_invoice_id(invoice)
+
+
+def _normal_invoice_issue_date(invoice: dict) -> str:
+    for field in ("dtEmissao", "dataEmissao"):
+        issue_date = _text(invoice.get(field)).strip()
+        if issue_date:
+            return issue_date
+    return ""
+
+
+def _normal_invoice_items(payload: object) -> list[dict]:
+    if isinstance(payload, list):
+        return [item for item in payload if isinstance(item, dict)]
+    if isinstance(payload, dict):
+        for key in ("content", "data", "items", "results", "responseList", "invoices"):
+            value = payload.get(key)
+            if isinstance(value, list):
+                return [item for item in value if isinstance(item, dict)]
+    return []
+
+
+def _normal_invoice_uc(invoice: dict) -> str:
+    for field in ("nuInstalacao", "cdInstalacao"):
+        uc = _normalize_uc_key(invoice.get(field))
+        if uc:
+            return uc
+
+    keys: list[str] = []
+    for field in (
+        "idUnidadeConsumo",
+        "codUnidadeConsumo",
+        "cdChaveExterna",
+        "noRecurso",
+    ):
+        value = _text(invoice.get(field)).strip()
+        if value:
+            keys.append(value)
+
+    consumer_units_raw = invoice.get("consumerUnits")
+    if isinstance(consumer_units_raw, list):
+        for value in consumer_units_raw:
+            if not isinstance(value, dict):
+                continue
+            resource = value.get("recurso") if isinstance(value.get("recurso"), dict) else None
+            if resource:
+                for field in ("idUnidadeConsumo", "cdChaveExterna", "noRecurso"):
+                    raw = _text(resource.get(field)).strip()
+                    if raw:
+                        keys.append(raw)
+            for field in ("idUnidadeConsumo", "cdChaveExterna", "noRecurso"):
+                raw = _text(value.get(field)).strip()
+                if raw:
+                    keys.append(raw)
+    elif consumer_units_raw is not None:
+        raw = _text(consumer_units_raw).strip()
+        if raw:
+            keys.append(raw)
+
+    if not keys:
+        return ""
+
+    try:
+        import powerrev_client
+
+        powerrev_client._load_consumer_units()
+        for key in dict.fromkeys(keys):
+            normalized_key = _normalize_uc_key(key)
+            uc = (
+                powerrev_client._UC_BY_ID.get(key.strip())
+                or powerrev_client._UC_BY_INSTALLATION.get(normalized_key)
+                or powerrev_client._UC_BY_CODE.get(normalized_key)
+            )
+            if uc and uc.get("nuInstalacao"):
+                return _normalize_uc_key(uc["nuInstalacao"])
+    except Exception:
+        logger.debug("Falha ao resolver UC da invoice normal.", exc_info=True)
+
+    return ""
+
+
+def _fetch_normal_invoice_issue_dates_for_month(
+    month: int,
+    target_ucs: set[str],
+) -> dict[tuple[str, int], str]:
+    if not target_ucs:
+        return {}
+
+    from powerrev_client import POWERREV_BASE_URL, _request
+
+    response = _request(
+        "GET",
+        f"{POWERREV_BASE_URL}/invoice",
+        params={"nuAnoMes": str(month)},
+    )
+    invoices = _normal_invoice_items(response.json())
+    selected_by_uc: dict[str, dict] = {}
+    for invoice in invoices:
+        uc_key = _normal_invoice_uc(invoice)
+        if not uc_key or uc_key not in target_ucs:
+            continue
+        issue_date = _normal_invoice_issue_date(invoice)
+        if not issue_date:
+            continue
+        current = selected_by_uc.get(uc_key)
+        if current is None or _normal_invoice_rank(invoice) > _normal_invoice_rank(current):
+            selected_by_uc[uc_key] = invoice
+
+    logger.info(
+        "Espelho: /invoice?nuAnoMes=%s retornou %d invoices; dtEmissao para %d/%d UCs.",
+        month,
+        len(invoices),
+        len(selected_by_uc),
+        len(target_ucs),
+    )
+    return {
+        (uc_key, month): _normal_invoice_issue_date(invoice)
+        for uc_key, invoice in selected_by_uc.items()
+    }
+
+
+def _populate_distributor_issue_dates(rows: list[list[str]]) -> None:
+    """Replica a coluna N do rateio: dtEmissao de /invoice?nuAnoMes por UC/mes."""
+    ucs_by_month: dict[int, set[str]] = defaultdict(set)
+    for row in rows:
+        uc_key = _normalize_uc_key(row[2])
+        month = _month_token(row[MIRROR_REFERENCE_MONTH_INDEX])
+        if not uc_key or month is None:
+            continue
+        ucs_by_month[month].add(uc_key)
+
+    issue_dates: dict[tuple[str, int], str] = {}
+    for month, target_ucs in sorted(ucs_by_month.items()):
+        try:
+            issue_dates.update(_fetch_normal_invoice_issue_dates_for_month(month, target_ucs))
+        except Exception as exc:
+            logger.warning(
+                "dtEmissao PowerRev via /invoice?nuAnoMes=%s indisponivel; mantendo fallback existente: %s",
+                month,
+                exc,
+            )
+
+    for row in rows:
+        uc_key = _normalize_uc_key(row[2])
+        month = _month_token(row[MIRROR_REFERENCE_MONTH_INDEX])
+        if not uc_key or month is None:
+            continue
+        issue_date = issue_dates.get((uc_key, month))
+        if issue_date:
+            row[MIRROR_ISSUE_DAY_INDEX] = issue_date
+
+
 def _populate_issue_days(rows: list[list[str]]) -> None:
     """Aplica PowerRev atual/anterior e, por ultimo, fallback do ClickUp."""
     by_uc: dict[str, dict[int, tuple[tuple[int, int, int, int, int, int], int]]] = (
@@ -502,6 +666,7 @@ def _read_source(source_ws) -> tuple[list[str], list[list[str]]]:
             + [invoice_id]
         )
 
+    _populate_distributor_issue_dates(rows)
     _populate_issue_days(rows)
     headers = (
         source_left_headers[:4]
