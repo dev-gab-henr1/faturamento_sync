@@ -956,6 +956,84 @@ def _make_row_keys(rows: list[list[str]]) -> list[str]:
     return keys
 
 
+def _reference_month_key(value: object) -> str:
+    month = _month_token(value)
+    if month is not None:
+        return str(month)
+    return _manual_label(value)
+
+
+def _stable_manual_identity(
+    task_id: object,
+    uc: object,
+    reference_month: object,
+) -> tuple[str, str, str]:
+    task_key = _task_id_from_link(task_id)
+    uc_key = _normalize_uc_key(uc)
+    month_key = _reference_month_key(reference_month)
+    if not task_key or not uc_key or not month_key:
+        return ("", "", "")
+    return task_key, uc_key, month_key
+
+
+def _row_stable_manual_identity(row: list[str]) -> tuple[str, str, str]:
+    normalized = _normalize_row(row, MIRROR_COLUMN_COUNT)
+    return _stable_manual_identity(
+        normalized[0],
+        normalized[2],
+        normalized[MIRROR_REFERENCE_MONTH_INDEX],
+    )
+
+
+def _record_stable_manual_identity(record: ProtectedRecord) -> tuple[str, str, str]:
+    return _stable_manual_identity(
+        record.task_id,
+        record.uc,
+        record.reference_month,
+    )
+
+
+def _row_identity_counts(rows: list[list[str]]) -> dict[tuple[str, str, str], int]:
+    counts: dict[tuple[str, str, str], int] = defaultdict(int)
+    for row in rows:
+        identity = _row_stable_manual_identity(row)
+        if all(identity):
+            counts[identity] += 1
+    return counts
+
+
+def _unique_records_by_identity(
+    records: dict[str, ProtectedRecord],
+) -> dict[tuple[str, str, str], ProtectedRecord]:
+    buckets: dict[tuple[str, str, str], list[ProtectedRecord]] = defaultdict(list)
+    for record in records.values():
+        identity = _record_stable_manual_identity(record)
+        if all(identity):
+            buckets[identity].append(record)
+
+    unique: dict[tuple[str, str, str], ProtectedRecord] = {}
+    for identity, items in buckets.items():
+        manual_values = {item.manual_values for item in items}
+        if len(manual_values) == 1:
+            unique[identity] = items[-1]
+    return unique
+
+
+def _remove_records_by_identity(
+    records: dict[str, ProtectedRecord],
+    identity: tuple[str, str, str],
+    *,
+    except_key: str = "",
+) -> None:
+    if not all(identity):
+        return
+    for existing_key, existing_record in list(records.items()):
+        if existing_key == except_key:
+            continue
+        if _record_stable_manual_identity(existing_record) == identity:
+            records.pop(existing_key, None)
+
+
 def _record_from_target_row(row: list[str]) -> ProtectedRecord:
     normalized = _normalize_row(row, MIRROR_COLUMN_COUNT)
     return ProtectedRecord(
@@ -1049,30 +1127,52 @@ def _merge_current_observations(
 ) -> dict[str, ProtectedRecord]:
     """Atualiza o arquivo tecnico respeitando inclusoes e limpezas manuais."""
     merged = dict(records)
+    target_identity_counts = _row_identity_counts(target_rows)
     for key, row in zip(_make_row_keys(target_rows), target_rows):
         record = _record_from_target_row(row)
+        identity = _record_stable_manual_identity(record)
+        unique_visible_identity = bool(
+            all(identity) and target_identity_counts.get(identity) == 1
+        )
         if any(value.strip() for value in record.manual_values):
+            if unique_visible_identity:
+                _remove_records_by_identity(merged, identity, except_key=key)
             merged[key] = record
         else:
-            # A linha visivel vazia representa limpeza manual intencional.
+            # A linha visivel vazia representa limpeza manual intencional
+            # quando a chave atual ja existia no arquivo tecnico.
+            had_exact_manual = bool(
+                key in merged
+                and any(value.strip() for value in merged[key].manual_values)
+            )
             merged.pop(key, None)
+            if had_exact_manual and unique_visible_identity:
+                _remove_records_by_identity(merged, identity)
     return merged
 
 
 def _project_observations(
     source_rows: list[list[str]],
     records: dict[str, ProtectedRecord],
-) -> tuple[list[list[str]], int]:
+) -> tuple[list[list[str]], int, dict[str, ProtectedRecord]]:
     projected: list[list[str]] = []
+    updated_records = dict(records)
+    source_identity_counts = _row_identity_counts(source_rows)
+    records_by_identity = _unique_records_by_identity(records)
     preserved = 0
     for key, row in zip(_make_row_keys(source_rows), source_rows):
         row_out = _normalize_row(row, MIRROR_COLUMN_COUNT)
         record = records.get(key)
+        if record is None:
+            identity = _row_stable_manual_identity(row_out)
+            if all(identity) and source_identity_counts.get(identity) == 1:
+                record = records_by_identity.get(identity)
         if record and any(value.strip() for value in record.manual_values):
             _apply_manual_values(row_out, record.manual_values)
+            updated_records[key] = _record_from_target_row(row_out)
             preserved += 1
         projected.append(row_out)
-    return projected, preserved
+    return projected, preserved, updated_records
 
 
 def _ensure_rows(ws, required_rows: int) -> None:
@@ -1238,7 +1338,10 @@ def sync_worksheets(
     archive_grid = _read_grid(archive_ws, "A:K", ARCHIVE_READ_WIDTH)
     archive_records = _read_archive(archive_ws) if archive_grid else {}
     archive_records = _merge_current_observations(archive_records, target_rows)
-    projected_rows, preserved = _project_observations(source_rows, archive_records)
+    projected_rows, preserved, archive_records = _project_observations(
+        source_rows,
+        archive_records,
+    )
 
     source_keys = _make_row_keys(projected_rows)
     target_keys = _make_row_keys(target_rows)
