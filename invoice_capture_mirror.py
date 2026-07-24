@@ -943,17 +943,27 @@ def _make_row_keys(rows: list[list[str]]) -> list[str]:
     for row in rows:
         normalized = _normalize_row(row, MIRROR_COLUMN_COUNT)
         invoice_id = normalized[MIRROR_INVOICE_ID_INDEX].strip()
-        if invoice_id:
+        if invoice_id and not _is_synthetic_invoice_id(invoice_id):
             base = f"INV:{invoice_id}"
         else:
-            base = "ROW:{}|{}|{}".format(
-                normalized[0].strip(),
-                normalized[2].strip(),
-                normalized[MIRROR_REFERENCE_MONTH_INDEX].strip(),
-            )
+            identity = _row_stable_manual_identity(normalized)
+            if all(identity):
+                base = "ROW:{}|{}|{}".format(*identity)
+            elif invoice_id:
+                base = f"SYN:{invoice_id}"
+            else:
+                base = "ROW:{}|{}|{}".format(
+                    normalized[0].strip(),
+                    normalized[2].strip(),
+                    normalized[MIRROR_REFERENCE_MONTH_INDEX].strip(),
+                )
         occurrences[base] += 1
         keys.append(f"{base}#{occurrences[base]}")
     return keys
+
+
+def _is_synthetic_invoice_id(value: object) -> bool:
+    return _text(value).strip().startswith("SYN|")
 
 
 def _reference_month_key(value: object) -> str:
@@ -1141,11 +1151,14 @@ def _merge_current_observations(
         else:
             # A linha visivel vazia representa limpeza manual intencional
             # quando a chave atual ja existia no arquivo tecnico.
+            exact_record = merged.get(key)
             had_exact_manual = bool(
-                key in merged
-                and any(value.strip() for value in merged[key].manual_values)
+                exact_record
+                and _record_stable_manual_identity(exact_record) == identity
+                and any(value.strip() for value in exact_record.manual_values)
             )
-            merged.pop(key, None)
+            if exact_record and _record_stable_manual_identity(exact_record) == identity:
+                merged.pop(key, None)
             if had_exact_manual and unique_visible_identity:
                 _remove_records_by_identity(merged, identity)
     return merged
@@ -1169,6 +1182,9 @@ def _project_observations(
                 record = records_by_identity.get(identity)
         if record and any(value.strip() for value in record.manual_values):
             _apply_manual_values(row_out, record.manual_values)
+            identity = _row_stable_manual_identity(row_out)
+            if all(identity):
+                _remove_records_by_identity(updated_records, identity, except_key=key)
             updated_records[key] = _record_from_target_row(row_out)
             preserved += 1
         projected.append(row_out)
@@ -1345,11 +1361,16 @@ def sync_worksheets(
 
     source_keys = _make_row_keys(projected_rows)
     target_keys = _make_row_keys(target_rows)
+    protected_values_need_rewrite = any(
+        _manual_values_from_row(current) != _manual_values_from_row(expected)
+        for current, expected in zip(target_rows, projected_rows)
+    )
     needs_rewrite = (
         target_headers != headers
         or source_keys != target_keys
         or len(source_rows) != len(target_rows)
         or has_stale_q_values
+        or protected_values_need_rewrite
         or any(
             _computed_values(current) != _computed_values(expected)
             for current, expected in zip(target_rows, projected_rows)
