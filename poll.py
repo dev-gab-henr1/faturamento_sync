@@ -39,6 +39,7 @@ except ImportError:  # pragma: no cover
     fcntl = None
 
 from config import (
+    CLICKUP_DELTA_LOOKBACK_SECONDS,
     DELTA_SYNC_INTERVAL_S,
     FULL_SYNC_DAILY_TIME,
     FULL_SYNC_TIMEZONE,
@@ -2575,10 +2576,14 @@ def delta_sync(last_updated_ts: int) -> int:
     begin_memory_cycle("DELTA SYNC")
     _refresh_distributed_lock_if_needed(force=True)
     now_ms = int(time.time() * 1000)
+    clickup_since_ms = max(
+        0,
+        last_updated_ts - int(CLICKUP_DELTA_LOOKBACK_SECONDS * 1000),
+    )
 
     tasks = fetch_all_tasks(
         include_closed=True,
-        date_updated_gt=last_updated_ts,
+        date_updated_gt=clickup_since_ms,
         transform=slim_task,
     )
     tasks, blocked_black_count, blocked_black_ids = _filter_out_planejamento_black(tasks)
