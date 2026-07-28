@@ -96,6 +96,7 @@ POWERREV_REFERENCE_MONTH_ONLY = os.getenv("POWERREV_REFERENCE_MONTH_ONLY", "").s
 
 # ── Sync timings ─────────────────────────────────────────
 DELTA_SYNC_INTERVAL_S = 600     # 10 min
+CLICKUP_DELTA_LOOKBACK_SECONDS = int(os.getenv("CLICKUP_DELTA_LOOKBACK_SECONDS", "14400"))
 FULL_SYNC_DAILY_TIME = os.getenv("FULL_SYNC_DAILY_TIME", "00:10").strip()
 FULL_SYNC_TIMEZONE = os.getenv("FULL_SYNC_TIMEZONE", "America/Sao_Paulo").strip()
 FULL_SYNC_RETRY_BASE_S = int(os.getenv("FULL_SYNC_RETRY_BASE_S", "60"))

@@ -2,7 +2,7 @@
 
 A planilha de faturamento e origem do espelho e recebe de volta somente o
 status de captura calculado no destino. As colunas M e O do destino sao
-preservadas pela chave Invoice ID.
+preservadas pelo estado visivel da linha e por uma identidade estavel.
 """
 
 from __future__ import annotations
@@ -58,22 +58,6 @@ MIRROR_CHECKBOX_INDEX = 14
 MIRROR_INVOICE_ID_INDEX = 15
 MIRROR_COLUMN_COUNT = 16
 MIRROR_WRITE_CHUNK_SIZE = 1000
-_POISONED_MANUAL_OBSERVATION_LABELS = {
-    "calculo pendente",
-    "calculada",
-    "cancelada",
-    "emitida",
-    "expirada",
-    "mes atual",
-    "mes seguinte",
-    "nao processado",
-    "paga",
-    "paga externamente",
-    "regras ausentes",
-    "sem fatura distribuidora",
-    "sem fatura da distribuidora",
-    "vencida",
-}
 SOURCE_DISTRIBUTOR_COLUMN = gspread.utils.rowcol_to_a1(
     1,
     COLUMN_ORDER.index("distribuidora") + 1,
@@ -662,7 +646,7 @@ def _read_source(source_ws) -> tuple[list[str], list[list[str]]]:
             + ["", ""]
             + [""]
             + [billing_status]
-            + [""]
+            + ["FALSE"]
             + [invoice_id]
         )
 
@@ -897,20 +881,18 @@ def _manual_label(value: object) -> str:
     return " ".join(normalized.replace("_", " ").replace("-", " ").split())
 
 
-def _is_valid_checkbox_text(value: object) -> bool:
-    return _text(value).strip().upper() in {"", "TRUE", "FALSE"}
-
-
 def _sanitize_manual_values(manual_values: Iterable[object]) -> tuple[str, str]:
     values = _normalize_row(manual_values, len(MIRROR_PROTECTED_HEADERS))
     observation = values[0]
-    checkbox = values[1]
-
-    if _manual_label(observation) in _POISONED_MANUAL_OBSERVATION_LABELS:
-        observation = ""
-    if not _is_valid_checkbox_text(checkbox):
-        checkbox = ""
+    checkbox = values[1].strip().upper()
+    if checkbox not in {"TRUE", "FALSE"}:
+        checkbox = "FALSE"
     return observation, checkbox
+
+
+def _has_manual_payload(manual_values: Iterable[object]) -> bool:
+    observation, checkbox = _sanitize_manual_values(manual_values)
+    return bool(observation.strip()) or checkbox.strip().upper() == "TRUE"
 
 
 def _manual_values_from_row(row: list[str]) -> tuple[str, str]:
@@ -1015,11 +997,7 @@ def _row_identity_counts(rows: list[list[str]]) -> dict[tuple[str, str, str], in
 def _unique_records_by_identity(
     records: dict[str, ProtectedRecord],
 ) -> dict[tuple[str, str, str], ProtectedRecord]:
-    buckets: dict[tuple[str, str, str], list[ProtectedRecord]] = defaultdict(list)
-    for record in records.values():
-        identity = _record_stable_manual_identity(record)
-        if all(identity):
-            buckets[identity].append(record)
+    buckets = _record_buckets_by_identity(records)
 
     unique: dict[tuple[str, str, str], ProtectedRecord] = {}
     for identity, items in buckets.items():
@@ -1027,6 +1005,17 @@ def _unique_records_by_identity(
         if len(manual_values) == 1:
             unique[identity] = items[-1]
     return unique
+
+
+def _record_buckets_by_identity(
+    records: dict[str, ProtectedRecord],
+) -> dict[tuple[str, str, str], list[ProtectedRecord]]:
+    buckets: dict[tuple[str, str, str], list[ProtectedRecord]] = defaultdict(list)
+    for record in records.values():
+        identity = _record_stable_manual_identity(record)
+        if all(identity):
+            buckets[identity].append(record)
+    return buckets
 
 
 def _remove_records_by_identity(
@@ -1053,6 +1042,15 @@ def _record_from_target_row(row: list[str]) -> ProtectedRecord:
         reference_month=normalized[MIRROR_REFERENCE_MONTH_INDEX],
         manual_values=_manual_values_from_row(normalized),
     )
+
+
+def _records_from_target_rows(
+    target_rows: list[list[str]],
+) -> dict[str, ProtectedRecord]:
+    return {
+        key: _record_from_target_row(row)
+        for key, row in zip(_make_row_keys(target_rows), target_rows)
+    }
 
 
 def _read_archive(archive_ws) -> dict[str, ProtectedRecord]:
@@ -1119,8 +1117,6 @@ def _read_archive(archive_ws) -> dict[str, ProtectedRecord]:
         else:
             manual_values = row[5:7]
         sanitized_manual_values = _sanitize_manual_values(manual_values)
-        if not any(value.strip() for value in sanitized_manual_values):
-            continue
         records[key] = ProtectedRecord(
             invoice_id=row[1],
             task_id=row[2],
@@ -1135,8 +1131,9 @@ def _merge_current_observations(
     records: dict[str, ProtectedRecord],
     target_rows: list[list[str]],
 ) -> dict[str, ProtectedRecord]:
-    """Atualiza o arquivo tecnico respeitando inclusoes e limpezas manuais."""
+    """Atualiza o arquivo tecnico com o estado manual atualmente visivel."""
     merged = dict(records)
+    archived_identity_buckets = _record_buckets_by_identity(records)
     target_identity_counts = _row_identity_counts(target_rows)
     for key, row in zip(_make_row_keys(target_rows), target_rows):
         record = _record_from_target_row(row)
@@ -1144,49 +1141,86 @@ def _merge_current_observations(
         unique_visible_identity = bool(
             all(identity) and target_identity_counts.get(identity) == 1
         )
-        if any(value.strip() for value in record.manual_values):
-            if unique_visible_identity:
-                _remove_records_by_identity(merged, identity, except_key=key)
+        had_archived_state = bool(
+            key in records
+            or (all(identity) and archived_identity_buckets.get(identity))
+        )
+        if unique_visible_identity:
+            _remove_records_by_identity(merged, identity, except_key=key)
+
+        if _has_manual_payload(record.manual_values) or had_archived_state:
             merged[key] = record
         else:
-            # A linha visivel vazia representa limpeza manual intencional
-            # quando a chave atual ja existia no arquivo tecnico.
-            exact_record = merged.get(key)
-            had_exact_manual = bool(
-                exact_record
-                and _record_stable_manual_identity(exact_record) == identity
-                and any(value.strip() for value in exact_record.manual_values)
-            )
-            if exact_record and _record_stable_manual_identity(exact_record) == identity:
-                merged.pop(key, None)
-            if had_exact_manual and unique_visible_identity:
-                _remove_records_by_identity(merged, identity)
+            merged.pop(key, None)
     return merged
 
 
 def _project_observations(
     source_rows: list[list[str]],
     records: dict[str, ProtectedRecord],
+    visible_records: dict[str, ProtectedRecord],
 ) -> tuple[list[list[str]], int, dict[str, ProtectedRecord]]:
     projected: list[list[str]] = []
     updated_records = dict(records)
     source_identity_counts = _row_identity_counts(source_rows)
+    visible_identity_buckets = _record_buckets_by_identity(visible_records)
+    visible_by_identity = _unique_records_by_identity(visible_records)
+    archive_identity_buckets = _record_buckets_by_identity(records)
     records_by_identity = _unique_records_by_identity(records)
     preserved = 0
     for key, row in zip(_make_row_keys(source_rows), source_rows):
         row_out = _normalize_row(row, MIRROR_COLUMN_COUNT)
-        record = records.get(key)
+        identity = _row_stable_manual_identity(row_out)
+        source_identity_is_unique = bool(
+            all(identity) and source_identity_counts.get(identity) == 1
+        )
+
+        # A aba visivel e sempre a fonte da verdade para M/O. O arquivo
+        # tecnico so entra quando nao existe uma linha visivel correspondente.
+        record = visible_records.get(key)
+        if record is None and all(identity):
+            visible_candidates = visible_identity_buckets.get(identity, [])
+            if source_identity_is_unique:
+                record = visible_by_identity.get(identity)
+            if record is None and any(
+                _has_manual_payload(item.manual_values)
+                for item in visible_candidates
+            ):
+                raise RuntimeError(
+                    "Associacao ambigua de campos manuais na aba Faturas; "
+                    "sincronizacao cancelada antes da reescrita."
+                )
+
+        archived_state_exists = bool(
+            key in records
+            or (all(identity) and archive_identity_buckets.get(identity))
+        )
         if record is None:
-            identity = _row_stable_manual_identity(row_out)
-            if all(identity) and source_identity_counts.get(identity) == 1:
-                record = records_by_identity.get(identity)
-        if record and any(value.strip() for value in record.manual_values):
+            record = records.get(key)
+            if record is None and all(identity):
+                archive_candidates = archive_identity_buckets.get(identity, [])
+                if source_identity_is_unique:
+                    record = records_by_identity.get(identity)
+                if record is None and any(
+                    _has_manual_payload(item.manual_values)
+                    for item in archive_candidates
+                ):
+                    raise RuntimeError(
+                        "Associacao ambigua no arquivo de campos manuais; "
+                        "sincronizacao cancelada antes da reescrita."
+                    )
+
+        if record is not None:
             _apply_manual_values(row_out, record.manual_values)
-            identity = _row_stable_manual_identity(row_out)
-            if all(identity):
+            if _has_manual_payload(record.manual_values):
+                preserved += 1
+
+        if record is not None and (
+            _has_manual_payload(record.manual_values) or archived_state_exists
+        ):
+            if source_identity_is_unique:
                 _remove_records_by_identity(updated_records, identity, except_key=key)
             updated_records[key] = _record_from_target_row(row_out)
-            preserved += 1
         projected.append(row_out)
     return projected, preserved, updated_records
 
@@ -1353,10 +1387,12 @@ def sync_worksheets(
 
     archive_grid = _read_grid(archive_ws, "A:K", ARCHIVE_READ_WIDTH)
     archive_records = _read_archive(archive_ws) if archive_grid else {}
+    visible_records = _records_from_target_rows(target_rows)
     archive_records = _merge_current_observations(archive_records, target_rows)
     projected_rows, preserved, archive_records = _project_observations(
         source_rows,
         archive_records,
+        visible_records,
     )
 
     source_keys = _make_row_keys(projected_rows)

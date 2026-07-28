@@ -16,6 +16,7 @@
 !powerrev_client.py
 !row_expander.py
 !sheets_manager.py
+!invoice_capture_mirror.py
 !stats.py
 !transformers.py
 !download_powerrev_pdfs_from_sheet.py
