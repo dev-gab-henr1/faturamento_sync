@@ -40,6 +40,8 @@ MIRROR_DISTRIBUTOR_HEADER = "Distribuidora"
 SOURCE_CAPTURE_STATUS_HEADER = "Captura de Faturas"
 SOURCE_BILLING_STATUS_HEADER = "Status de faturamento"
 MIRROR_BILLING_STATUS_HEADER = "Status de Fatura"
+MIRROR_LOGIN_HEADER = "Login da Distribuidora"
+MIRROR_PASSWORD_HEADER = "Senha da Distribuidora"
 MIRROR_ISSUE_DAY_HEADER = "Data de Emissão"
 MIRROR_IDEAL_SEND_DAY_HEADER = "Data de Envio Ideal"
 MIRROR_SEND_MONTH_HEADER = "Mês de envio do boleto"
@@ -55,8 +57,10 @@ MIRROR_SEND_MONTH_INDEX = 11
 MIRROR_OBSERVATIONS_INDEX = 12
 MIRROR_BILLING_STATUS_INDEX = 13
 MIRROR_CHECKBOX_INDEX = 14
-MIRROR_INVOICE_ID_INDEX = 15
-MIRROR_COLUMN_COUNT = 16
+MIRROR_LOGIN_INDEX = 15
+MIRROR_PASSWORD_INDEX = 16
+MIRROR_INVOICE_ID_INDEX = 17
+MIRROR_COLUMN_COUNT = 18
 MIRROR_WRITE_CHUNK_SIZE = 1000
 SOURCE_DISTRIBUTOR_COLUMN = gspread.utils.rowcol_to_a1(
     1,
@@ -77,6 +81,14 @@ SOURCE_ISSUE_DATE_COLUMN = gspread.utils.rowcol_to_a1(
 SOURCE_CAPTURE_STATUS_COLUMN = gspread.utils.rowcol_to_a1(
     1,
     COLUMN_ORDER.index("captura_faturas") + 1,
+).replace("1", "")
+SOURCE_LOGIN_COLUMN = gspread.utils.rowcol_to_a1(
+    1,
+    COLUMN_ORDER.index("login_distribuidora") + 1,
+).replace("1", "")
+SOURCE_PASSWORD_COLUMN = gspread.utils.rowcol_to_a1(
+    1,
+    COLUMN_ORDER.index("senha_distribuidora") + 1,
 ).replace("1", "")
 ARCHIVE_HEADERS = [
     "Chave técnica",
@@ -559,23 +571,36 @@ def _read_source(source_ws) -> tuple[list[str], list[list[str]]]:
     billing_status_range = f"{SOURCE_BILLING_STATUS_COLUMN}:{SOURCE_BILLING_STATUS_COLUMN}"
     invoice_range = f"{SOURCE_INVOICE_COLUMN}:{SOURCE_INVOICE_COLUMN}"
     issue_date_range = f"{SOURCE_ISSUE_DATE_COLUMN}:{SOURCE_ISSUE_DATE_COLUMN}"
+    login_range = f"{SOURCE_LOGIN_COLUMN}:{SOURCE_LOGIN_COLUMN}"
+    password_range = f"{SOURCE_PASSWORD_COLUMN}:{SOURCE_PASSWORD_COLUMN}"
     ranges = _retry(
         source_ws.batch_get,
-        ["A:H", distributor_range, issue_date_range, billing_status_range, invoice_range],
+        [
+            "A:H",
+            distributor_range,
+            issue_date_range,
+            billing_status_range,
+            login_range,
+            password_range,
+            invoice_range,
+        ],
         value_render_option="FORMATTED_VALUE",
     )
-    if len(ranges) != 5:
+    if len(ranges) != 7:
         raise RuntimeError(
             "Leitura da origem nao retornou os intervalos "
             f"A:H, {distributor_range}, {issue_date_range}, "
-            f"{billing_status_range} e {invoice_range}."
+            f"{billing_status_range}, {login_range}, {password_range} "
+            f"e {invoice_range}."
         )
 
     left = ranges[0] or []
     distributors = ranges[1] or []
     issue_dates = ranges[2] or []
     billing_statuses = ranges[3] or []
-    invoice_ids = ranges[4] or []
+    logins = ranges[4] or []
+    passwords = ranges[5] or []
+    invoice_ids = ranges[6] or []
     if not left or len(left[0]) < MIRROR_LEFT_SOURCE_COLUMN_COUNT:
         raise RuntimeError("A planilha de faturamento nao possui os cabecalhos A:H esperados.")
 
@@ -604,6 +629,20 @@ def _read_source(source_ws) -> tuple[list[str], list[list[str]]]:
             f"A coluna {SOURCE_BILLING_STATUS_COLUMN} da planilha de faturamento nao e "
             "'Status de faturamento'; espelhamento cancelado antes de qualquer escrita."
         )
+    login_header = _text(logins[0][0] if logins and logins[0] else "").strip()
+    if login_header != MIRROR_LOGIN_HEADER:
+        raise RuntimeError(
+            f"A coluna {SOURCE_LOGIN_COLUMN} da planilha de faturamento nao e "
+            "'Login da Distribuidora'; espelhamento cancelado antes de qualquer escrita."
+        )
+    password_header = _text(
+        passwords[0][0] if passwords and passwords[0] else ""
+    ).strip()
+    if password_header != MIRROR_PASSWORD_HEADER:
+        raise RuntimeError(
+            f"A coluna {SOURCE_PASSWORD_COLUMN} da planilha de faturamento nao e "
+            "'Senha da Distribuidora'; espelhamento cancelado antes de qualquer escrita."
+        )
     invoice_header = _text(invoice_ids[0][0] if invoice_ids and invoice_ids[0] else "").strip()
     if invoice_header != MIRROR_INVOICE_ID_HEADER:
         raise RuntimeError(
@@ -616,12 +655,16 @@ def _read_source(source_ws) -> tuple[list[str], list[list[str]]]:
     data_distributors = distributors[1:]
     data_issue_dates = issue_dates[1:]
     data_billing_statuses = billing_statuses[1:]
+    data_logins = logins[1:]
+    data_passwords = passwords[1:]
     data_invoice_ids = invoice_ids[1:]
     row_count = _last_nonempty_row(
         data_left,
         data_distributors,
         data_issue_dates,
         data_billing_statuses,
+        data_logins,
+        data_passwords,
         data_invoice_ids,
     )
     rows: list[list[str]] = []
@@ -632,11 +675,15 @@ def _read_source(source_ws) -> tuple[list[str], list[list[str]]]:
         billing_status_row = (
             data_billing_statuses[index] if index < len(data_billing_statuses) else []
         )
+        login_row = data_logins[index] if index < len(data_logins) else []
+        password_row = data_passwords[index] if index < len(data_passwords) else []
         invoice_row = data_invoice_ids[index] if index < len(data_invoice_ids) else []
         normalized_left = _normalize_row(left_row, MIRROR_LEFT_SOURCE_COLUMN_COUNT)
         distributor = _text(distributor_row[0] if distributor_row else "")
         issue_date = _text(issue_date_row[0] if issue_date_row else "")
         billing_status = _text(billing_status_row[0] if billing_status_row else "")
+        login = _text(login_row[0] if login_row else "")
+        password = _text(password_row[0] if password_row else "")
         invoice_id = _text(invoice_row[0] if invoice_row else "")
         rows.append(
             normalized_left[:4]
@@ -647,7 +694,7 @@ def _read_source(source_ws) -> tuple[list[str], list[list[str]]]:
             + [""]
             + [billing_status]
             + ["FALSE"]
-            + [invoice_id]
+            + [login, password, invoice_id]
         )
 
     _populate_distributor_issue_dates(rows)
@@ -663,6 +710,8 @@ def _read_source(source_ws) -> tuple[list[str], list[list[str]]]:
             MIRROR_OBSERVATIONS_HEADER,
             MIRROR_BILLING_STATUS_HEADER,
             "Concluido",
+            MIRROR_LOGIN_HEADER,
+            MIRROR_PASSWORD_HEADER,
         ]
         + [MIRROR_INVOICE_ID_HEADER]
     )
@@ -796,27 +845,48 @@ def _is_previous_status_with_extra_manual_layout(header: list[str]) -> bool:
     )
 
 
+def _is_previous_current_target_layout(header: list[str]) -> bool:
+    normalized = _normalize_row(header, 18)
+    return (
+        normalized[0] == "Task ID"
+        and normalized[4] == MIRROR_DISTRIBUTOR_HEADER
+        and normalized[MIRROR_BILLING_STATUS_INDEX] == MIRROR_BILLING_STATUS_HEADER
+        and normalized[14] == "Concluido"
+        and normalized[15] == MIRROR_INVOICE_ID_HEADER
+        and not normalized[16]
+        and not normalized[17]
+    )
+
+
 def _is_current_target_layout(header: list[str]) -> bool:
     normalized = _normalize_row(header, MIRROR_COLUMN_COUNT)
     return (
         normalized[0] == "Task ID"
         and normalized[4] == MIRROR_DISTRIBUTOR_HEADER
         and normalized[MIRROR_BILLING_STATUS_INDEX] == MIRROR_BILLING_STATUS_HEADER
+        and normalized[MIRROR_LOGIN_INDEX] == MIRROR_LOGIN_HEADER
+        and normalized[MIRROR_PASSWORD_INDEX] == MIRROR_PASSWORD_HEADER
         and normalized[MIRROR_INVOICE_ID_INDEX] == MIRROR_INVOICE_ID_HEADER
     )
 
 
+def _upgrade_previous_current_row(row: list[str]) -> list[str]:
+    normalized = _normalize_row(row, 16)
+    return normalized[:15] + ["", ""] + [normalized[15]]
+
+
 def _convert_previous_status_extra_row(row: list[str]) -> list[str]:
     normalized = _normalize_row(row, 17)
-    return (
+    previous_current = (
         normalized[:10]
         + [normalized[11], normalized[12], normalized[13]]
         + [normalized[10], normalized[15], normalized[16]]
     )
+    return _upgrade_previous_current_row(previous_current)
 
 
 def _normalize_target_grid(grid: list[list[str]]) -> list[list[str]]:
-    """Converte layouts antigos para o layout atual A:P, se necessario."""
+    """Converte layouts antigos para o layout atual A:R, se necessario."""
     if not grid:
         return grid
     is_current = _is_current_target_layout(grid[0])
@@ -824,8 +894,12 @@ def _normalize_target_grid(grid: list[list[str]]) -> list[list[str]]:
     is_previous_distributor = _is_previous_distributor_target_layout(grid[0])
     is_previous_status = _is_previous_status_without_extra_manual_layout(grid[0])
     is_previous_status_extra = _is_previous_status_with_extra_manual_layout(grid[0])
+    is_previous_current = _is_previous_current_target_layout(grid[0])
     if is_current:
-        converted = [_normalize_row(grid[0], MIRROR_COLUMN_COUNT)]
+        return [_normalize_row(row, MIRROR_COLUMN_COUNT) for row in grid]
+
+    if is_previous_current:
+        converted = [_upgrade_previous_current_row(grid[0])]
         for row in grid[1:]:
             normalized17 = _normalize_row(row, 17)
             p_looks_like_old_checkbox = normalized17[15].strip().upper() in {
@@ -834,9 +908,7 @@ def _normalize_target_grid(grid: list[list[str]]) -> list[list[str]]:
             if p_looks_like_old_checkbox:
                 converted.append(_convert_previous_status_extra_row(normalized17))
             else:
-                # Layout atual ja e A:P. Qualquer valor residual em Q deve ser
-                # ignorado para nao deslocar N/P para M/O.
-                converted.append(_normalize_row(row, MIRROR_COLUMN_COUNT))
+                converted.append(_upgrade_previous_current_row(row))
         return converted
 
     if not any((
@@ -850,28 +922,31 @@ def _normalize_target_grid(grid: list[list[str]]) -> list[list[str]]:
     converted: list[list[str]] = []
     for row in grid:
         if is_legacy_no_distributor:
-            normalized = _normalize_row(row, MIRROR_COLUMN_COUNT)
-            converted.append(
+            normalized = _normalize_row(row, 16)
+            previous_current = (
                 normalized[:4]
                 + [""]
                 + normalized[4:11]
                 + [normalized[11], "", normalized[12], normalized[13]]
             )
+            converted.append(_upgrade_previous_current_row(previous_current))
         elif is_previous_distributor:
-            normalized = _normalize_row(row, MIRROR_COLUMN_COUNT)
-            converted.append(
+            normalized = _normalize_row(row, 16)
+            previous_current = (
                 normalized[:12]
                 + [normalized[12], "", normalized[13], normalized[14]]
             )
+            converted.append(_upgrade_previous_current_row(previous_current))
         elif is_previous_status_extra:
             converted.append(_convert_previous_status_extra_row(row))
         else:
-            normalized = _normalize_row(row, MIRROR_COLUMN_COUNT)
-            converted.append(
+            normalized = _normalize_row(row, 16)
+            previous_current = (
                 normalized[:10]
                 + [normalized[11], normalized[12], normalized[13]]
                 + [normalized[10], normalized[14], normalized[15]]
             )
+            converted.append(_upgrade_previous_current_row(previous_current))
     return converted
 
 
@@ -914,7 +989,7 @@ def _computed_values(row: list[str]) -> list[str]:
     return (
         normalized[:MIRROR_OBSERVATIONS_INDEX]
         + [normalized[MIRROR_BILLING_STATUS_INDEX]]
-        + [normalized[MIRROR_INVOICE_ID_INDEX]]
+        + normalized[MIRROR_LOGIN_INDEX:MIRROR_INVOICE_ID_INDEX + 1]
     )
 
 
@@ -1280,20 +1355,13 @@ def _write_full_target(
         )
         output.append(row_out)
     _ensure_rows(target_ws, max(len(output), 1))
-    _write_matrix(target_ws, 1, output, "P")
+    _write_matrix(target_ws, 1, output, "R")
     _ensure_concluido_checkbox(target_ws)
-
-    stale_q_last_row = max(previous_row_count + 1, len(output), 1)
-    _retry(
-        target_ws.batch_clear,
-        [f"Q1:Q{stale_q_last_row}"],
-        is_write=True,
-    )
 
     if previous_row_count > len(rows):
         _retry(
             target_ws.batch_clear,
-            [f"A{len(rows) + 2}:P{previous_row_count + 1}"],
+            [f"A{len(rows) + 2}:R{previous_row_count + 1}"],
             is_write=True,
         )
 
@@ -1325,8 +1393,12 @@ def _write_delta_target(
                 "values": [[row[MIRROR_BILLING_STATUS_INDEX]]],
             })
             updates.append({
-                "range": f"P{sheet_row}",
-                "values": [[row[MIRROR_INVOICE_ID_INDEX]]],
+                "range": f"P{sheet_row}:R{sheet_row}",
+                "values": [[
+                    row[MIRROR_LOGIN_INDEX],
+                    row[MIRROR_PASSWORD_INDEX],
+                    row[MIRROR_INVOICE_ID_INDEX],
+                ]],
             })
         _retry(
             target_ws.batch_update,
@@ -1376,14 +1448,10 @@ def sync_worksheets(
 ) -> MirrorResult:
     """Sincroniza worksheets ja resolvidas; util para testes sem rede."""
     headers, source_rows = _read_source(source_ws)
-    target_raw_grid = _read_grid(target_ws, "A:Q", 17)
+    target_raw_grid = _read_grid(target_ws, "A:R", MIRROR_COLUMN_COUNT)
     target_grid = _normalize_target_grid(target_raw_grid)
     target_headers = target_grid[0] if target_grid else []
     target_rows = target_grid[1:] if target_grid else []
-    has_stale_q_values = any(
-        _normalize_row(row, 17)[16].strip()
-        for row in target_raw_grid
-    )
 
     archive_grid = _read_grid(archive_ws, "A:K", ARCHIVE_READ_WIDTH)
     archive_records = _read_archive(archive_ws) if archive_grid else {}
@@ -1405,7 +1473,6 @@ def sync_worksheets(
         target_headers != headers
         or source_keys != target_keys
         or len(source_rows) != len(target_rows)
-        or has_stale_q_values
         or protected_values_need_rewrite
         or any(
             _computed_values(current) != _computed_values(expected)
@@ -1542,7 +1609,7 @@ def validate_invoice_capture_mirror(limit: int | None = None) -> dict[str, objec
 
     headers, source_rows = _read_source(source_ws)
     target_grid = _normalize_target_grid(
-        _read_grid(target_ws, "A:Q", 17)
+        _read_grid(target_ws, "A:R", MIRROR_COLUMN_COUNT)
     )
     target_headers = target_grid[0] if target_grid else []
     target_rows = target_grid[1:] if target_grid else []
