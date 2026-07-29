@@ -1069,19 +1069,6 @@ def _row_identity_counts(rows: list[list[str]]) -> dict[tuple[str, str, str], in
     return counts
 
 
-def _unique_records_by_identity(
-    records: dict[str, ProtectedRecord],
-) -> dict[tuple[str, str, str], ProtectedRecord]:
-    buckets = _record_buckets_by_identity(records)
-
-    unique: dict[tuple[str, str, str], ProtectedRecord] = {}
-    for identity, items in buckets.items():
-        manual_values = {item.manual_values for item in items}
-        if len(manual_values) == 1:
-            unique[identity] = items[-1]
-    return unique
-
-
 def _record_buckets_by_identity(
     records: dict[str, ProtectedRecord],
 ) -> dict[tuple[str, str, str], list[ProtectedRecord]]:
@@ -1091,6 +1078,47 @@ def _record_buckets_by_identity(
         if all(identity):
             buckets[identity].append(record)
     return buckets
+
+
+def _match_records_to_source(
+    source_rows: list[list[str]],
+    records: dict[str, ProtectedRecord],
+) -> dict[str, tuple[str, ProtectedRecord]]:
+    source_items = list(zip(_make_row_keys(source_rows), source_rows))
+    matches: dict[str, tuple[str, ProtectedRecord]] = {}
+    consumed_record_keys: set[str] = set()
+
+    # Invoice IDs iguais sempre identificam linhas distintas antes do fallback.
+    for source_key, _ in source_items:
+        record = records.get(source_key)
+        if record is not None:
+            matches[source_key] = (source_key, record)
+            consumed_record_keys.add(source_key)
+
+    remaining_by_identity: dict[
+        tuple[str, str, str],
+        list[tuple[str, ProtectedRecord]],
+    ] = defaultdict(list)
+    for record_key, record in records.items():
+        if record_key in consumed_record_keys:
+            continue
+        identity = _record_stable_manual_identity(record)
+        if all(identity):
+            remaining_by_identity[identity].append((record_key, record))
+
+    next_candidate: dict[tuple[str, str, str], int] = defaultdict(int)
+    for source_key, source_row in source_items:
+        if source_key in matches:
+            continue
+        identity = _row_stable_manual_identity(source_row)
+        candidates = remaining_by_identity.get(identity, [])
+        candidate_index = next_candidate[identity]
+        if candidate_index >= len(candidates):
+            continue
+        matches[source_key] = candidates[candidate_index]
+        next_candidate[identity] += 1
+
+    return matches
 
 
 def _record_keys_by_identity(
@@ -1286,52 +1314,25 @@ def _project_observations(
     updated_records = dict(records)
     updated_identity_keys = _record_keys_by_identity(updated_records)
     source_identity_counts = _row_identity_counts(source_rows)
-    visible_identity_buckets = _record_buckets_by_identity(visible_records)
-    visible_by_identity = _unique_records_by_identity(visible_records)
+    visible_matches = _match_records_to_source(source_rows, visible_records)
+    archive_matches = _match_records_to_source(source_rows, records)
     archive_identity_buckets = _record_buckets_by_identity(records)
-    records_by_identity = _unique_records_by_identity(records)
     preserved = 0
     for key, row in zip(_make_row_keys(source_rows), source_rows):
         row_out = _normalize_row(row, MIRROR_COLUMN_COUNT)
         identity = _row_stable_manual_identity(row_out)
-        source_identity_is_unique = bool(
-            all(identity) and source_identity_counts.get(identity) == 1
-        )
 
         # A aba visivel e sempre a fonte da verdade para M/O. O arquivo
         # tecnico so entra quando nao existe uma linha visivel correspondente.
-        record = visible_records.get(key)
-        if record is None and all(identity):
-            visible_candidates = visible_identity_buckets.get(identity, [])
-            if source_identity_is_unique:
-                record = visible_by_identity.get(identity)
-            if record is None and any(
-                _has_manual_payload(item.manual_values)
-                for item in visible_candidates
-            ):
-                raise RuntimeError(
-                    "Associacao ambigua de campos manuais na aba Faturas; "
-                    "sincronizacao cancelada antes da reescrita."
-                )
+        matched = visible_matches.get(key)
+        if matched is None:
+            matched = archive_matches.get(key)
+        matched_record_key, record = matched if matched is not None else ("", None)
 
         archived_state_exists = bool(
             key in records
             or (all(identity) and archive_identity_buckets.get(identity))
         )
-        if record is None:
-            record = records.get(key)
-            if record is None and all(identity):
-                archive_candidates = archive_identity_buckets.get(identity, [])
-                if source_identity_is_unique:
-                    record = records_by_identity.get(identity)
-                if record is None and any(
-                    _has_manual_payload(item.manual_values)
-                    for item in archive_candidates
-                ):
-                    raise RuntimeError(
-                        "Associacao ambigua no arquivo de campos manuais; "
-                        "sincronizacao cancelada antes da reescrita."
-                    )
 
         if record is not None:
             _apply_manual_values(row_out, record.manual_values)
@@ -1341,12 +1342,18 @@ def _project_observations(
         if record is not None and (
             _has_manual_payload(record.manual_values) or archived_state_exists
         ):
-            if source_identity_is_unique:
+            if all(identity) and source_identity_counts.get(identity) == 1:
                 _remove_records_by_identity(
                     updated_records,
                     updated_identity_keys,
                     identity,
                     except_key=key,
+                )
+            elif matched_record_key and matched_record_key != key:
+                _discard_record(
+                    updated_records,
+                    updated_identity_keys,
+                    matched_record_key,
                 )
             _store_record(
                 updated_records,
