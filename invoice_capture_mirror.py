@@ -1093,19 +1093,60 @@ def _record_buckets_by_identity(
     return buckets
 
 
+def _record_keys_by_identity(
+    records: dict[str, ProtectedRecord],
+) -> dict[tuple[str, str, str], set[str]]:
+    keys_by_identity: dict[tuple[str, str, str], set[str]] = defaultdict(set)
+    for key, record in records.items():
+        identity = _record_stable_manual_identity(record)
+        if all(identity):
+            keys_by_identity[identity].add(key)
+    return keys_by_identity
+
+
+def _discard_record(
+    records: dict[str, ProtectedRecord],
+    keys_by_identity: dict[tuple[str, str, str], set[str]],
+    key: str,
+) -> None:
+    record = records.pop(key, None)
+    if record is None:
+        return
+    identity = _record_stable_manual_identity(record)
+    identity_keys = keys_by_identity.get(identity)
+    if identity_keys is None:
+        return
+    identity_keys.discard(key)
+    if not identity_keys:
+        keys_by_identity.pop(identity, None)
+
+
+def _store_record(
+    records: dict[str, ProtectedRecord],
+    keys_by_identity: dict[tuple[str, str, str], set[str]],
+    key: str,
+    record: ProtectedRecord,
+) -> None:
+    _discard_record(records, keys_by_identity, key)
+    records[key] = record
+    identity = _record_stable_manual_identity(record)
+    if all(identity):
+        keys_by_identity.setdefault(identity, set()).add(key)
+
+
 def _remove_records_by_identity(
     records: dict[str, ProtectedRecord],
+    keys_by_identity: dict[tuple[str, str, str], set[str]],
     identity: tuple[str, str, str],
     *,
     except_key: str = "",
 ) -> None:
     if not all(identity):
         return
-    for existing_key, existing_record in list(records.items()):
+    for existing_key in tuple(keys_by_identity.get(identity, ())):
         if existing_key == except_key:
             continue
-        if _record_stable_manual_identity(existing_record) == identity:
-            records.pop(existing_key, None)
+        _discard_record(records, keys_by_identity, existing_key)
 
 
 def _record_from_target_row(row: list[str]) -> ProtectedRecord:
@@ -1208,6 +1249,7 @@ def _merge_current_observations(
 ) -> dict[str, ProtectedRecord]:
     """Atualiza o arquivo tecnico com o estado manual atualmente visivel."""
     merged = dict(records)
+    merged_identity_keys = _record_keys_by_identity(merged)
     archived_identity_buckets = _record_buckets_by_identity(records)
     target_identity_counts = _row_identity_counts(target_rows)
     for key, row in zip(_make_row_keys(target_rows), target_rows):
@@ -1221,12 +1263,17 @@ def _merge_current_observations(
             or (all(identity) and archived_identity_buckets.get(identity))
         )
         if unique_visible_identity:
-            _remove_records_by_identity(merged, identity, except_key=key)
+            _remove_records_by_identity(
+                merged,
+                merged_identity_keys,
+                identity,
+                except_key=key,
+            )
 
         if _has_manual_payload(record.manual_values) or had_archived_state:
-            merged[key] = record
+            _store_record(merged, merged_identity_keys, key, record)
         else:
-            merged.pop(key, None)
+            _discard_record(merged, merged_identity_keys, key)
     return merged
 
 
@@ -1237,6 +1284,7 @@ def _project_observations(
 ) -> tuple[list[list[str]], int, dict[str, ProtectedRecord]]:
     projected: list[list[str]] = []
     updated_records = dict(records)
+    updated_identity_keys = _record_keys_by_identity(updated_records)
     source_identity_counts = _row_identity_counts(source_rows)
     visible_identity_buckets = _record_buckets_by_identity(visible_records)
     visible_by_identity = _unique_records_by_identity(visible_records)
@@ -1294,8 +1342,18 @@ def _project_observations(
             _has_manual_payload(record.manual_values) or archived_state_exists
         ):
             if source_identity_is_unique:
-                _remove_records_by_identity(updated_records, identity, except_key=key)
-            updated_records[key] = _record_from_target_row(row_out)
+                _remove_records_by_identity(
+                    updated_records,
+                    updated_identity_keys,
+                    identity,
+                    except_key=key,
+                )
+            _store_record(
+                updated_records,
+                updated_identity_keys,
+                key,
+                _record_from_target_row(row_out),
+            )
         projected.append(row_out)
     return projected, preserved, updated_records
 
