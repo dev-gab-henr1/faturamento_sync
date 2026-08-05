@@ -578,6 +578,7 @@ _STATUS_AGUARDANDO_CADASTRO_USINA = "ae80bc03-d28f-4bc3-ae2f-653accd64e0b"
 _STATUS_AGUARDANDO_CADASTRO_CONTINGENCIA = "1c4aabb2-3fb0-4e2d-8a67-03025ac2654d"
 _STATUS_NOVO_COOPERADO = "d5c6593b-4cf8-4b70-aa28-2e38132e9d19"
 _STATUS_NOVO_COOPERADO_CONTINGENCIA = "33d364f8-2838-40d5-a82e-70f96e8650c8"
+_STATUS_CANCELADO_AUTOCONSUMO = "730f4951-937e-4918-9c2e-43515b4954da"
 _STATUS_CF_ID = "1a5118f7-b9a0-466f-889d-37edd76bd304"
 _STATUS_TROCA_PLANO_LABEL = "Encerrado - Troca de Plano"
 _STATUS_PLANEJAMENTO_BLACK_LABEL = "Planejamento - Black"
@@ -586,6 +587,7 @@ _STATUS_AGUARDANDO_CADASTRO_USINA_LABEL = "Aguardando Cadastro - Usina"
 _STATUS_AGUARDANDO_CADASTRO_CONTINGENCIA_LABEL = "Aguardando Cadastro - em Contingência"
 _STATUS_NOVO_COOPERADO_LABEL = "Novo Cooperado"
 _STATUS_NOVO_COOPERADO_CONTINGENCIA_LABEL = "Novo Cooperado - Em Contingência"
+_STATUS_CANCELADO_AUTOCONSUMO_LABEL = "Cancelado - Autoconsumo"
 _PLANEJAMENTO_LIST_ID = "901321549851"
 _BLOCKED_STATUS_LABEL = "status bloqueado para faturamento"
 _BLOCKED_STATUS_DEFINITIONS = (
@@ -594,6 +596,7 @@ _BLOCKED_STATUS_DEFINITIONS = (
     (_STATUS_AGUARDANDO_CADASTRO_CONTINGENCIA, _STATUS_AGUARDANDO_CADASTRO_CONTINGENCIA_LABEL),
     (_STATUS_NOVO_COOPERADO, _STATUS_NOVO_COOPERADO_LABEL),
     (_STATUS_NOVO_COOPERADO_CONTINGENCIA, _STATUS_NOVO_COOPERADO_CONTINGENCIA_LABEL),
+    (_STATUS_CANCELADO_AUTOCONSUMO, _STATUS_CANCELADO_AUTOCONSUMO_LABEL),
 )
 _BLOCKED_STATUS_TEXT_NORMALIZED_ALIASES = (
     "aguardando cadastro em contingaancia",
@@ -789,7 +792,7 @@ def _filter_out_planejamento_black(tasks: list[dict]) -> tuple[list[dict], int, 
     """Remove status que nao devem entrar no faturamento.
 
     Nome mantido por compatibilidade interna; hoje inclui Planejamento - Black
-    e status iniciais de cadastro/novo cooperado.
+    e status iniciais de cadastro/novo cooperado ou cancelamento de autoconsumo.
     """
     filtered: list[dict] = []
     blocked = 0
