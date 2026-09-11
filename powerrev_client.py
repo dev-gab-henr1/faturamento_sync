@@ -186,6 +186,7 @@ def _authenticate() -> str:
                 f"{POWERREV_AUTH_URL}/sign",
                 json={"accountId": POWERREV_ACCOUNT_ID, "apiKey": POWERREV_API_KEY},
                 headers={"Content-Type": "application/json"},
+                timeout=POWERREV_TIMEOUT,
             )
             stats.powerrev_requests += 1
             resp.raise_for_status()
@@ -219,6 +220,7 @@ def _get_headers() -> dict[str, str]:
 def _request(method: str, url: str, **kwargs) -> requests.Response:
     global _TOKEN
     session = _get_session()
+    kwargs.setdefault("timeout", POWERREV_TIMEOUT)
 
     attempt = 0
     while attempt < POWERREV_MAX_RETRIES:
@@ -234,10 +236,22 @@ def _request(method: str, url: str, **kwargs) -> requests.Response:
                 continue  # não incrementa attempt
 
             if resp.status_code == 429:
-                retry_after = int(resp.headers.get("Retry-After", "30"))
-                logger.warning("PowerRev rate limit 429, aguardando %ds", retry_after)
-                time.sleep(retry_after)
-                continue  # não incrementa attempt
+                attempt += 1
+                try:
+                    retry_after = int(resp.headers.get("Retry-After", "30"))
+                except (TypeError, ValueError):
+                    retry_after = 30
+                retry_after = max(1, min(retry_after, 60))
+                logger.warning(
+                    "PowerRev rate limit 429 (tentativa %d/%d), aguardando %ds",
+                    attempt,
+                    POWERREV_MAX_RETRIES,
+                    retry_after,
+                )
+                if attempt < POWERREV_MAX_RETRIES:
+                    time.sleep(retry_after)
+                    continue
+                resp.raise_for_status()
 
             if resp.status_code in (500, 502, 503):
                 attempt += 1
