@@ -598,6 +598,7 @@ _PLANEJAMENTO_LIST_ID = "901321549851"
 _BLOCKED_STATUS_LABEL = "status bloqueado para faturamento"
 _BLOCKED_STATUS_DEFINITIONS = (
     (_STATUS_PLANEJAMENTO_BLACK, _STATUS_PLANEJAMENTO_BLACK_LABEL),
+    (_STATUS_ENCERRADO_FINANCEIRO, _STATUS_ENCERRADO_FINANCEIRO_LABEL),
     (_STATUS_AGUARDANDO_CADASTRO_USINA, _STATUS_AGUARDANDO_CADASTRO_USINA_LABEL),
     (_STATUS_AGUARDANDO_CADASTRO_CONTINGENCIA, _STATUS_AGUARDANDO_CADASTRO_CONTINGENCIA_LABEL),
     (_STATUS_NOVO_COOPERADO, _STATUS_NOVO_COOPERADO_LABEL),
@@ -625,7 +626,6 @@ _NEVER_JOINED_STATUS_LABELS = (
     "Eliminado",
     "Excluido",
     "Demitido",
-    "Encerrado - Financeiro",
     "Baixo Consumo",
 )
 
@@ -808,8 +808,9 @@ def _filter_out_never_joined_terminated(tasks: list[dict]) -> tuple[list[dict], 
 def _filter_out_planejamento_black(tasks: list[dict]) -> tuple[list[dict], int, set[str]]:
     """Remove status que nao devem entrar no faturamento.
 
-    Nome mantido por compatibilidade interna; hoje inclui Planejamento - Black
-    e status iniciais de cadastro/novo cooperado ou cancelamento de autoconsumo.
+    Nome mantido por compatibilidade interna; inclui Planejamento - Black,
+    Encerrado - Financeiro e status iniciais de cadastro/novo cooperado ou
+    cancelamento de autoconsumo.
     """
     filtered: list[dict] = []
     blocked = 0
@@ -843,6 +844,31 @@ def _remove_rows_by_task_ids(ws, headers: list[str], task_ids: set[str]) -> int:
         raw_task = str(row[task_id_col]).strip() if len(row) > task_id_col else ""
         tid = _extract_task_id_from_link(raw_task)
         if tid and tid in task_ids:
+            removed += 1
+            continue
+        kept_rows.append(row)
+
+    if removed > 0:
+        write_all_rows(ws, kept_rows, existing_data_rows=existing)
+    return removed
+
+
+def _remove_rows_by_detailed_status(ws, headers: list[str], status_label: str) -> int:
+    try:
+        status_col = _header_index(headers, "Status Detalhado")
+    except ValueError:
+        return 0
+
+    existing = read_all_rows(ws)
+    if not existing:
+        return 0
+
+    target = _normalize_status_label(status_label)
+    kept_rows: list[list[str]] = []
+    removed = 0
+    for row in existing:
+        value = str(row[status_col]).strip() if len(row) > status_col else ""
+        if _normalize_status_label(value) == target:
             removed += 1
             continue
         kept_rows.append(row)
@@ -2612,6 +2638,18 @@ def delta_sync(last_updated_ts: int) -> int:
     ws = get_worksheet()
     ensure_headers(ws)
     headers = get_headers()
+
+    removed_financial_status_rows = _remove_rows_by_detailed_status(
+        ws,
+        headers,
+        _STATUS_ENCERRADO_FINANCEIRO_LABEL,
+    )
+    if removed_financial_status_rows:
+        logger.info(
+            "Delta ClickUp: %d linhas removidas por status %s.",
+            removed_financial_status_rows,
+            _STATUS_ENCERRADO_FINANCEIRO_LABEL,
+        )
 
     if blocked_black_count:
         logger.info(
